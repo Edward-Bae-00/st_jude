@@ -1,0 +1,27 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Large raw datasets (>100MB exceeds GitHub file limit; scd_cache.json is tracked)
+PMC-Patients/PMC-Patients-V2.json
+PMC-Patients/PMC-Patients.csv
+*.tar.gz
+*.zip
+
+# Generated audit artifacts
+scripts/audit/booklet_layout.txt
+scripts/audit/booklet_grades.json
+scripts/audit/grade_diffs.json
+
+# Local environment and logs
+.env
+.venv/
+env/
+venv/
+*.log
