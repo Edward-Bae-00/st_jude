@@ -4,6 +4,49 @@ This repository contains the deterministic rule engine for the **Sickle Cell Out
 
 ---
 
+## 📦 Datasets & Data Acquisition
+
+### 1. Pre-Packaged Data (Included in Git Repository)
+
+The repository comes pre-packaged with all data required to run the test suite and feature extraction experiments immediately upon cloning:
+
+- **[`PMC-Patients/scd_cache.json`](PMC-Patients/scd_cache.json) (3.6 MB):** 978 curated Sickle Cell Disease (SCD) patient case reports filtered from the PubMed Central patient dataset. This is the primary dataset read by `scripts/experiments/medgemma_extraction.py`.
+- **[`data/clincal_notes.csv`](data/clincal_notes.csv) & [`data/clincal_notes_org.csv`](data/clincal_notes_org.csv):** Clinical note datasets with multi-outcome labels.
+- **[`data/scogs_feature_schema.json`](data/scogs_feature_schema.json):** The 137 clinical feature schema definitions for the 53 SCOGS health outcomes.
+
+---
+
+### 2. Downloading Full Raw Datasets (~1.3 GB)
+
+If you need the entire raw 250,000-patient case report corpus from PubMed Central (e.g. for broader cohort exploration or training):
+
+#### Automated Download Script (Cross-Platform: Windows, Mac, Linux)
+Run the built-in downloader script:
+
+```bash
+# Downloads full PMC-Patients-V2.json (~800MB) & PMC-Patients.csv (~520MB) from Hugging Face
+python scripts/download_data.py
+```
+
+Options:
+```bash
+python scripts/download_data.py --files v2    # Download only PMC-Patients-V2.json
+python scripts/download_data.py --files csv   # Download only PMC-Patients.csv
+python scripts/download_data.py --force       # Re-download even if already present
+```
+
+#### Manual Download Links (Hugging Face)
+You can also download the files directly from the official [Hugging Face dataset repo (`zhengyun21/PMC-Patients`)](https://huggingface.co/datasets/zhengyun21/PMC-Patients):
+
+- **PMC-Patients-V2.json (250,294 patients):**
+  [`https://huggingface.co/datasets/zhengyun21/PMC-Patients/resolve/main/PMC-Patients-V2.json`](https://huggingface.co/datasets/zhengyun21/PMC-Patients/resolve/main/PMC-Patients-V2.json)
+- **PMC-Patients.csv (167k patient summaries):**
+  [`https://huggingface.co/datasets/zhengyun21/PMC-Patients/resolve/main/PMC-Patients.csv`](https://huggingface.co/datasets/zhengyun21/PMC-Patients/resolve/main/PMC-Patients.csv)
+
+Place the downloaded files inside the `PMC-Patients/` directory at the project root.
+
+---
+
 ## Quick Start & Installation
 
 ### 1. Clone & Set Up Python Environment
@@ -161,6 +204,7 @@ All detailed extractions and clinical note text are saved to the JSON file speci
 ├── docs/
 │   └── windows_gpu_setup.md       # Detailed Windows NVIDIA GPU setup guide
 ├── scripts/
+│   ├── download_data.py           # Automated dataset downloader & cache builder
 │   ├── audit/                     # Booklet extraction and comparison scripts
 │   ├── experiments/
 │   │   └── medgemma_extraction.py # Main MedGemma extraction test harness
@@ -177,6 +221,8 @@ All detailed extractions and clinical note text are saved to the JSON file speci
 ├── tests/                         # Pytest test suite (264 tests)
 ├── data/                          # Feature schemas & dataset metadata
 ├── PMC-Patients/
-│   └── scd_cache.json             # 978 pre-filtered sickle cell patient summaries
+│   ├── scd_cache.json             # 978 pre-filtered sickle cell patient summaries
+│   ├── PMC-Patients-V2.json       # Full raw patient corpus (downloaded via script)
+│   └── PMC-Patients.csv           # Full patient summary table (downloaded via script)
 └── results/                       # Generated experiment results & artifacts
 ```
