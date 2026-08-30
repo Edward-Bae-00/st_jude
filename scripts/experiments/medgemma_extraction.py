@@ -29,6 +29,10 @@ Usage examples:
 
     # 4. Mock backend (no GPU/model required):
     python3 scripts/experiments/medgemma_extraction.py --backend mock --notes 2
+
+    # 5. Throughput run on a GPU with VRAM to spare (needs OLLAMA_NUM_PARALLEL>=4).
+    #    Measure run-to-run consistency separately, at --concurrency 1:
+    python scripts/experiments/medgemma_extraction.py --tier full --notes 20 --concurrency 4 --out results/full.json
 """
 from __future__ import annotations
 
@@ -38,11 +42,13 @@ import os
 import pathlib
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 # Ensure UTF-8 output on Windows consoles (prevents charmap / cp1252 encode errors on °, µ, ×, etc.)
@@ -161,8 +167,10 @@ def get_model_info(model: str, host: str) -> dict:
 
 def call_ollama(prompt: str, model: str, host: str, stats: dict | None = None,
                 timeout: int = 300, **kwargs) -> str:
+    # keep_alive -1 pins the model in VRAM. Without it Ollama unloads after 5 idle
+    # minutes and the next call silently pays a full reload - 50+ GB at the F16 tier.
     body = json.dumps({"model": model, "prompt": prompt, "stream": False,
-                       "format": "json",
+                       "format": "json", "keep_alive": -1,
                        "options": {"temperature": 0, "seed": 0, "num_predict": 1024, "repeat_penalty": 1.1}}).encode("utf-8")
     req = urllib.request.Request(f"{host}/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
@@ -597,23 +605,54 @@ def select_notes(pool: list[dict], n: int, outcomes: list[str], *, seed: int = 2
     return picked, selection
 
 
-def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300):
-    results = {}
-    stats = {"prompt_eval_count": 0, "eval_count": 0, "eval_duration_sec": 0.0, "total_duration_sec": 0.0}
+def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300,
+        concurrency=1):
+    """Model calls first (optionally in parallel), then verification - always serial.
+
+    Verification stays on the main thread in the original note-major order, so the
+    Tally accumulates identically at any concurrency and `Tally` itself never needs
+    a lock. Only the backend calls fan out.
+
+    Each task carries its own stats dict; `call_ollama` does an unlocked
+    read-modify-write on that dict, which is only safe because no two tasks share
+    one. They are summed here.
+    """
+    tasks = [(rec, num) for rec in notes for num in outcomes]
+    total, done = len(tasks), 0
+    replies, stats_parts = [None] * total, [None] * total
+    print_lock = threading.Lock()
     t0 = time.time()
-    total_notes = len(notes)
-    for idx, rec in enumerate(notes):
-        note = rec["patient"]
-        per_outcome = {}
-        for num in outcomes:
-            print(f"  [{idx+1}/{total_notes}] processing UID {rec['patient_uid']} outcome {num} ({TABLES[num].name})...", flush=True)
-            prompt = build_prompt(note, num)
-            reply = BACKENDS[backend](prompt, model, host, stats=stats, quant=quant, timeout=timeout)
-            feats, present = verify(reply, note, tally)
-            per_outcome[num] = (feats, present, reply)
-        results[rec["patient_uid"]] = per_outcome
-    tally.prompt_tokens += stats["prompt_eval_count"]
-    tally.completion_tokens += stats["eval_count"]
+
+    def call(i):
+        nonlocal done
+        rec, num = tasks[i]
+        local = {"prompt_eval_count": 0, "eval_count": 0,
+                 "eval_duration_sec": 0.0, "total_duration_sec": 0.0}
+        reply = BACKENDS[backend](build_prompt(rec["patient"], num), model, host,
+                                  stats=local, quant=quant, timeout=timeout)
+        replies[i], stats_parts[i] = reply, local
+        with print_lock:
+            done += 1
+            print(f"  [{done}/{total}] UID {rec['patient_uid']} outcome {num} "
+                  f"({TABLES[num].name})", flush=True)
+
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(call, range(total)))
+    else:
+        for i in range(total):
+            call(i)
+
+    results = {}
+    for i, (rec, num) in enumerate(tasks):
+        reply = replies[i] or ""
+        feats, present = verify(reply, rec["patient"], tally)
+        results.setdefault(rec["patient_uid"], {})[num] = (feats, present, reply)
+
+    for part in stats_parts:
+        if part:
+            tally.prompt_tokens += part["prompt_eval_count"]
+            tally.completion_tokens += part["eval_count"]
     tally.wall_clock_sec += (time.time() - t0)
     return results
 
@@ -644,8 +683,19 @@ def main() -> int:
                     help="comma-separated; default is a common-outcome sample")
     ap.add_argument("--repeat", type=int, default=1,
                     help="run N times and report run-to-run consistency at temperature 0")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="in-flight backend requests (default 1 = sequential). Needs a "
+                         "server that batches, e.g. OLLAMA_NUM_PARALLEL>=N. See the "
+                         "warning printed when this is combined with --repeat")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+
+    if a.concurrency > 1 and a.backend == "hf":
+        print("!! --backend hf holds one lazily-initialised global pipeline and is not "
+              "safe to call\n   concurrently. Forcing --concurrency 1.")
+        a.concurrency = 1
+    if a.concurrency < 1:
+        raise SystemExit("--concurrency must be >= 1")
 
     tier = TIERS[a.tier]
     if a.model:
@@ -670,16 +720,29 @@ def main() -> int:
     print(f"tier={a.tier}  weights={tier['hf']}  served-as={model}  backend={a.backend}")
     if a.backend == "hf":
         print(f"hf_quant={a.quant}")
-    print(f"notes={len(notes)}  outcomes={','.join(outcomes)}  repeat={a.repeat}")
+    print(f"notes={len(notes)}  outcomes={','.join(outcomes)}  repeat={a.repeat}  "
+          f"concurrency={a.concurrency}")
     print(f"tier_note={tier['note']}")
     print("=" * 70)
+
+    if a.concurrency > 1 and a.repeat > 1:
+        print()
+        print("!! CONCURRENCY WARNING - run-to-run consistency is confounded.")
+        print(f"   At --concurrency {a.concurrency} the server batches requests, and a batch's")
+        print("   composition depends on timing, so it differs between repeats. Batched float")
+        print("   reductions are not bit-identical, so a token can flip at temperature 0 for")
+        print("   reasons that have nothing to do with the model. Mismatches below are then")
+        print("   'model nondeterminism OR batching', and you cannot tell which.")
+        print("   Measure consistency with --concurrency 1. Use >1 for throughput and cost.")
+        print()
 
     runs, tallies = [], []
     for i in range(a.repeat):
         t = Tally()
         t_start = time.time()
         try:
-            runs.append(run(notes, outcomes, a.backend, model, a.host, t, quant=a.quant, timeout=a.timeout))
+            runs.append(run(notes, outcomes, a.backend, model, a.host, t,
+                            quant=a.quant, timeout=a.timeout, concurrency=a.concurrency))
         except (urllib.error.URLError, TimeoutError) as e:
             raise SystemExit(f"backend unreachable at {a.host}: {e}\n"
                              f"start it, or use --backend mock to exercise the harness")
@@ -813,6 +876,10 @@ def main() -> int:
                 "holdout_frac": a.holdout_frac if a.stratify else None,
                 "outcomes": outcomes,
                 "repeat": a.repeat,
+                "concurrency": a.concurrency,
+                # True when consistency was measured under batching, which can flip a
+                # token at temperature 0 for reasons unrelated to the model.
+                "consistency_confounded_by_batching": a.concurrency > 1 and a.repeat > 1,
             },
             "profiling": {
                 "total_wall_clock_sec": round(tallies[0].wall_clock_sec, 2),
