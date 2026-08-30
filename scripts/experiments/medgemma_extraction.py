@@ -41,6 +41,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -272,16 +273,24 @@ def call_openai_compatible(prompt: str, model: str, host: str, stats: dict | Non
 
 def call_mock(prompt: str, model: str, host: str, stats: dict | None = None, **kwargs) -> str:
     """Deterministic stand-in so the harness itself can be tested and reviewed
-    without a GPU. Emits one findable quote and one deliberate hallucination."""
+    without a GPU. Emits one findable quote and one deliberate hallucination, so
+    the verifier must report exactly 50%.
+
+    `present` is flipped deterministically per (note, outcome) so the ABSENT path
+    is exercised too - otherwise the absence audit has nothing to run on and a
+    broken absent branch ships unnoticed. It does not touch the quote tally,
+    which counts proposals regardless of presence."""
     m = re.search(r'NOTE:\n"""(.*)"""', prompt, re.S)
     note = m.group(1) if m else ""
+    outcome = (re.search(r"Health outcome under consideration: (\S+)", prompt) or [None, "0"])[1]
+    present = zlib.crc32(f"{outcome}:{note[:120]}".encode()) % 3 != 0
     first = next((w for w in re.findall(r"[A-Za-z]{6,}", note)), "unknown")
     if stats is not None:
         stats["prompt_eval_count"] = stats.get("prompt_eval_count", 0) + 100
         stats["eval_count"] = stats.get("eval_count", 0) + 50
         stats["eval_duration_sec"] = stats.get("eval_duration_sec", 0.0) + 0.01
         stats["total_duration_sec"] = stats.get("total_duration_sec", 0.0) + 0.01
-    return json.dumps({"present": True, "findings": [
+    return json.dumps({"present": present, "findings": [
         {"feature": "death_attributed", "value": False, "quote": first},
         {"feature": "death_attributed", "value": True,
          "quote": "a sentence that is definitely not in this note"},
@@ -299,8 +308,20 @@ BACKENDS = {
 
 # ------------------------------------------------------- verification & scoring
 
+# SentencePiece byte-token wreckage from a badly converted GGUF. Its presence
+# means the served weights are corrupt, not that the model hallucinated - so it
+# is counted and reported, never quietly normalized into a passing quote.
+ARTIFACT = re.compile(r"\[UNK_BYTE_|\u2581")
+
+
 def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+    # Strip community GGUF SentencePiece byte token artifacts (e.g. [UNK_BYTE_0xe29681▁...])
+    s = re.sub(r"\[UNK_BYTE_[^\]]+\]", " ", s)
+    s = s.replace("\u2581", " ")
+    s = re.sub(r"\s+", " ", s)
+    # Strip whitespace before closing punctuation from dataset scraping artifacts (e.g. '(Figure )' -> '(Figure)')
+    s = re.sub(r"\s+([\)\]\.,;:])", r"\1", s)
+    return s.strip().lower()
 
 
 @dataclass
@@ -313,6 +334,7 @@ class Tally:
     unknown_feature: int = 0
     accepted: int = 0
     bad_json: int = 0
+    tokenizer_artifacts: int = 0   # quotes carrying corrupt-GGUF byte tokens
     per_feature: Counter = field(default_factory=Counter)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -320,11 +342,24 @@ class Tally:
 
     def report(self):
         p = self.proposed or 1
+        # A null-quote placeholder is a prompt-compliance failure, not a grounding
+        # result. Reporting one grounding number lets the denominator be chosen to
+        # flatter the model, so both are always emitted together.
+        quoted = self.quote_ok + self.quote_unfound
+        q = quoted or 1
         return {
             "proposed": self.proposed,
             "accepted": self.accepted,
+            "quoted": quoted,
+            "quote_verified": self.quote_ok,
+            "quote_unfound": self.quote_unfound,
+            "null_placeholder": self.quote_missing,
+            "null_placeholder_pct": round(100 * self.quote_missing / p, 1),
             "quote_verified_pct": round(100 * self.quote_ok / p, 1),
+            "quote_verified_pct_of_quoted": round(100 * self.quote_ok / q, 1),
             "hallucinated_quote_pct": round(100 * self.quote_unfound / p, 1),
+            "hallucinated_pct_of_quoted": round(100 * self.quote_unfound / q, 1),
+            "tokenizer_artifacts": self.tokenizer_artifacts,
             "missing_quote": self.quote_missing,
             "invalid_value": self.value_bad,
             "unknown_feature": self.unknown_feature,
@@ -370,6 +405,8 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None]:
         if not quote:
             tally.quote_missing += 1
             continue
+        if ARTIFACT.search(quote):
+            tally.tokenizer_artifacts += 1
         if normalize(quote) not in hay:
             tally.quote_unfound += 1          # the §2 rule doing its job
             continue
@@ -386,8 +423,54 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None]:
 
 # ------------------------------------------------------------------------ main
 
-def load_notes(n: int, seed: int = 20260828) -> list[dict]:
-    import random
+# Cohort gate. Three traps live in this corpus and each one silently poisons the
+# eval set with a note that can only ever score `absent`:
+#   1. "sickle cell trait" is the heterozygous carrier state, not the disease.
+#   2. In cardiology, SCD means *sudden cardiac death* - so the bare abbreviation
+#      never qualifies a note on its own.
+#   3. The mention may be negated, or belong to the mother rather than the patient.
+SICKLE_EXPLICIT = re.compile(r"sickle[- ]cell(?!\s+trait)|HbSS|HbSC|\bHb\s?S\b", re.I)
+SCD_TERM = re.compile(r"sickle[- ]cell(?!\s+trait)|HbSS|HbSC|\bHb\s?S\b|\bSCD\b", re.I)
+NEG_SCD = re.compile(r"(?:denie[sd]|den(?:y|ying)|no|without|negative for|ruled out|"
+                     r"family history|maternal|paternal|mother|father|sibling|"
+                     r"brother|sister|cousin)\b[^.]{0,70}?"
+                     r"(?:sickle[- ]cell|\bSCD\b|HbSS|HbSC)", re.I)
+TRAIT = re.compile(r"sickle[- ]cell\s+trait", re.I)
+
+
+def _clean(text: str) -> str:
+    """Drop trait mentions, then mentions that are negated or somebody else's."""
+    return NEG_SCD.sub(" ", TRAIT.sub(" ", text or ""))
+
+
+def scd_mentions(text: str) -> int:
+    """SCD mentions that are the patient's own and not negated."""
+    return len(SCD_TERM.findall(_clean(text)))
+
+
+def is_scd_primary(rec: dict) -> bool:
+    """Is this note ABOUT sickle cell disease, or does it merely say the words?
+
+    The loose mention regex admits notes whose only SCD reference is a denial
+    ("denied a family history of SCD"), a carrier state, the mother's diagnosis,
+    or a cardiology note using SCD for sudden cardiac death. Those land in the
+    eval set as guaranteed `absent`, inflating the absent count and deflating
+    every rate computed over the sample - a measurement artifact indistinguishable
+    from a model that simply extracts nothing.
+    """
+    raw_title = rec.get("title", "") or ""
+    if TRAIT.search(raw_title) and not SICKLE_EXPLICIT.search(TRAIT.sub(" ", raw_title)):
+        return False                       # a paper titled "Sickle Cell Trait: ..." is about trait
+    if SICKLE_EXPLICIT.search(_clean(raw_title)):
+        return True                        # the paper names the disease in its title
+    body = _clean(rec.get("patient", "") or "")
+    if not SICKLE_EXPLICIT.search(body):
+        return False                       # "SCD" alone is not evidence of sickle cell
+    return len(SCD_TERM.findall(body)) >= 2
+
+
+def load_notes(cohort: str = "loose") -> list[dict]:
+    """The candidate pool. Selection happens in select_notes()."""
     cache = ROOT / "PMC-Patients" / "scd_cache.json"
     if cache.exists():
         scd = json.loads(cache.read_text(encoding="utf-8"))
@@ -400,7 +483,118 @@ def load_notes(n: int, seed: int = 20260828) -> list[dict]:
             cache.write_text(json.dumps(scd), encoding="utf-8")
         except Exception:
             pass
-    return random.Random(seed).sample(scd, min(n, len(scd)))
+    if cohort == "scd_primary":
+        kept = [r for r in scd if is_scd_primary(r)]
+        print(f"cohort=scd_primary: {len(kept)}/{len(scd)} kept "
+              f"({len(scd) - len(kept)} dropped as mention-only)")
+        scd = kept
+    return scd
+
+
+# ------------------------------------------------------------- note selection
+#
+# The unit of evaluation is the (note, outcome) PAIR, not the note. `absent` is a
+# first-class answer (plan §1), so an eval set needs outcomes that are genuinely
+# present AND outcomes that are genuinely not - otherwise the absent decision,
+# which is what actually gates whether anything gets graded, goes unmeasured.
+#
+# Seeds pick notes only. They never touch extraction, features or grading, so
+# they cannot bias a grade - but they DO bias which cases get seen, toward the
+# lexically obvious ones. That is what the unstratified holdout is for: it is
+# drawn at random from the same pool, so the size of the bias is measurable
+# rather than merely disclosed.
+
+OUTCOME_SEEDS = {
+    "10": r"chronic pain|daily pain|persistent pain",
+    "19": r"acute kidney injur|\bAKI\b|renal failure|rising creatinine|creatinine",
+    "24": r"priapism",
+    "28": r"pain(ful)? (crisis|crises|episode)|vaso-?occlusive|\bVOC\b|sickle cell crisis|pain control",
+    "29": r"splenic sequestration|sequestration crisis",
+    "30": r"alloimmuni|delayed h(a)?emolytic|\bDHTR\b",
+    "34": r"iron overload|h(a)?emochromatosis|h(a)?emosiderosis|ferritin|chelat",
+    "35": r"aplastic crisis|parvovirus",
+    "36": r"\bfever|febrile|pyrexia|temperature of \d",
+    "37": r"sepsis|septic|bacter(a)?emia",
+    "40": r"leg ulcer|ankle ulcer|venous ulcer",
+    "43": r"multiorgan failure|multi-organ failure|\bMOF\b",
+    "48": r"acute chest|chest syndrome|\bACS\b",
+    "49": r"asthma|wheez|bronchodilator",
+    "04": r"heart failure|\bCHF\b|cardiac decompensation",
+    "05": r"myocardial infarction|\bMI\b|troponin",
+    "06": r"hypertension|hypertensive|elevated blood pressure",
+    "11": r"cognitive|neurocognitive|memory (loss|impairment)",
+    "15": r"stroke|infarct|h(a)?emorrhage|\bCVA\b",
+    "18": r"cholecyst|cholelith|gallstone|gallbladder",
+    "21": r"chronic kidney disease|\bCKD\b|nephropathy|proteinuria",
+    "31": r"hypersplenism|splenomegaly",
+    "32": r"hepatopathy|hepatic|liver (failure|dysfunction)|transaminas",
+    "39": r"avascular necrosis|osteonecrosis|\bAVN\b",
+    "42": r"osteoporo|osteopeni|bone mineral density",
+    "47": r"depress|\bPHQ",
+    "52": r"pulmonary hypertension|\bPAH\b|elevated TRV",
+    "53": r"sleep apn(o)?ea|\bOSA\b|polysomnograph",
+}
+
+
+def outcome_seed(num: str) -> re.Pattern:
+    """A lexical prior for 'this note probably discusses outcome `num`'.
+
+    Falls back to the outcome's own name, which is usually enough ("Priapism",
+    "Leg Ulcer", "Osteomyelitis"); OUTCOME_SEEDS covers the ones where the
+    rubric's phrasing is not what a clinician writes.
+    """
+    if num in OUTCOME_SEEDS:
+        return re.compile(OUTCOME_SEEDS[num], re.I)
+    name = TABLES[num].name
+    alts = []
+    paren = re.search(r"\(([^)]*)\)", name)
+    base = re.sub(r"\s*\([^)]*\)", "", name).strip()
+    alts += [re.escape(x.strip()) for x in base.split("/") if x.strip()]
+    if paren and re.fullmatch(r"[A-Z]{2,6}", paren.group(1).strip()):
+        alts.append(r"\b" + re.escape(paren.group(1).strip()) + r"\b")
+    return re.compile("|".join(alts), re.I)
+
+
+def select_notes(pool: list[dict], n: int, outcomes: list[str], *, seed: int = 20260828,
+                 holdout_frac: float = 0.25, stratify: bool = True):
+    """-> (notes, selection) where selection maps uid -> 'seeded:<outcome>' | 'holdout'."""
+    import random
+    rng = random.Random(seed)
+    if not stratify:
+        picked = rng.sample(pool, min(n, len(pool)))
+        return picked, {r["patient_uid"]: "random" for r in picked}
+
+    n_hold = max(1, round(n * holdout_frac))
+    n_strat = max(0, n - n_hold)
+    per = [n_strat // len(outcomes)] * len(outcomes)
+    for i in range(n_strat - sum(per)):
+        per[i] += 1
+
+    picked, selection = [], {}
+    taken = set()
+    for num, want in zip(outcomes, per):
+        pat = outcome_seed(num)
+        cands = [r for r in pool
+                 if r["patient_uid"] not in taken and pat.search(r.get("patient", "") or "")]
+        got = rng.sample(cands, min(want, len(cands)))
+        if len(got) < want:
+            print(f"  seeded {num:>3s} ({TABLES[num].name[:28]}): only {len(got)}/{want} "
+                  f"candidates in the pool")
+        for r in got:
+            taken.add(r["patient_uid"])
+            selection[r["patient_uid"]] = f"seeded:{num}"
+        picked += got
+
+    rest = [r for r in pool if r["patient_uid"] not in taken]
+    hold = rng.sample(rest, min(n_hold, len(rest)))
+    for r in hold:
+        selection[r["patient_uid"]] = "holdout"
+    picked += hold
+
+    seeded_n = len(picked) - len(hold)
+    print(f"selection: {seeded_n} seeded across {len(outcomes)} outcomes + "
+          f"{len(hold)} unstratified holdout = {len(picked)} notes")
+    return picked, selection
 
 
 def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300):
@@ -438,6 +632,14 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300,
                     help="per-request timeout in seconds (default 300)")
     ap.add_argument("--notes", type=int, default=20)
+    ap.add_argument("--cohort", choices=["scd_primary", "loose"], default="loose",
+                    help="pool definition. loose (default): any SCD mention - keeps notes "
+                         "where outcomes are genuinely absent, which the absence audit needs. "
+                         "scd_primary: SCD-primary notes only")
+    ap.add_argument("--stratify", action=argparse.BooleanOptionalAction, default=True,
+                    help="pick notes to hit every target outcome, plus a random holdout")
+    ap.add_argument("--holdout-frac", type=float, default=0.25,
+                    help="fraction of notes drawn at random, to measure the seeds' bias")
     ap.add_argument("--outcomes", default="28,48,36,19",
                     help="comma-separated; default is a common-outcome sample")
     ap.add_argument("--repeat", type=int, default=1,
@@ -457,7 +659,9 @@ def main() -> int:
     for o in outcomes:
         if o not in TABLES: raise SystemExit(f"unknown outcome {o!r}")
 
-    notes = load_notes(a.notes)
+    pool = load_notes(cohort=a.cohort)
+    notes, selection = select_notes(pool, a.notes, outcomes,
+                                    holdout_frac=a.holdout_frac, stratify=a.stratify)
     model_info = get_model_info(model, a.host) if a.backend == "ollama" else {}
     model_digest = model_info.get("details", {}).get("parent_model", "") or model_info.get("model_info", {}).get("general.file_type", "")
 
@@ -486,21 +690,30 @@ def main() -> int:
         tok_per_sec = t.completion_tokens / t.wall_clock_sec if t.wall_clock_sec > 0 else 0
         print(f"\nRun {i+1} completed in {t.wall_clock_sec:.1f}s ({sec_per_note:.2f}s/note, {tok_per_sec:.1f} tok/s):")
         print(f"  Proposed findings:    {rep['proposed']}")
-        print(f"  Accepted findings:    {rep['accepted']} ({rep['quote_verified_pct']}% quote-verified)")
-        print(f"  Hallucinated quotes:  {rep['hallucinated_quote_pct']}% ({t.quote_unfound})")
+        print(f"    null placeholders:  {rep['null_placeholder']:4d}  {rep['null_placeholder_pct']:5.1f}%  (no quote -> prompt not followed)")
+        print(f"    quote verified:     {t.quote_ok:4d}  {rep['quote_verified_pct_of_quoted']:5.1f}% of quoted | {rep['quote_verified_pct']:.1f}% of all")
+        print(f"    quote not in note:  {t.quote_unfound:4d}  {rep['hallucinated_pct_of_quoted']:5.1f}% of quoted | {rep['hallucinated_quote_pct']:.1f}% of all")
+        print(f"  Accepted findings:    {rep['accepted']}")
         print(f"  Invalid values:       {rep['invalid_value']}")
+        if rep['tokenizer_artifacts']:
+            print(f"  !! TOKENIZER ARTIFACTS: {rep['tokenizer_artifacts']} quotes carry corrupt GGUF byte tokens.")
+            print(f"     The served weights are broken; these numbers are not a clean measurement.")
         print(f"  Unparseable replies:  {rep['unparseable_replies']}")
         print(f"  Prompt tokens:        {rep['prompt_tokens']} (~{rep['prompt_tokens']//len(notes)} tok/note)")
         print(f"  Completion tokens:    {rep['completion_tokens']} (~{rep['completion_tokens']//len(notes)} tok/note)")
 
     # grades, from the run-1 features through the real decision tables
     statuses = Counter()
+    by_outcome = {num: Counter() for num in outcomes}
+    by_selection = {"seeded": Counter(), "holdout": Counter(), "random": Counter()}
     grade_results_detail = {}
     for uid, per in runs[0].items():
         grade_results_detail[uid] = {}
         for num, (feats, present, *_) in per.items():
             res = grade(num, feats, present=bool(present))
             statuses[res.status] += 1
+            by_outcome[num][res.status] += 1
+            by_selection[selection[uid].split(":")[0]][res.status] += 1
             grade_results_detail[uid][num] = {
                 "status": res.status,
                 "grade": res.grade,
@@ -512,6 +725,20 @@ def main() -> int:
     print(f"\nGrade status over {len(notes)}x{len(outcomes)} note-outcome pairs:")
     for k, v in statuses.most_common():
         print(f"   {k:14s} {v:3d} ({100*v/(len(notes)*len(outcomes)):.1f}%)")
+
+    cols = ["graded", "grade_set", "cannot_grade", "absent", "not_applicable"]
+    print(f"\nPer outcome (n={len(notes)} each) - a pooled number hides this shape:")
+    print(f"   {'':>3s} {'outcome':30s} " + " ".join(f"{c[:12]:>12s}" for c in cols))
+    for num in outcomes:
+        c = by_outcome[num]
+        print(f"   {num:>3s} {TABLES[num].name[:30]:30s} "
+              + " ".join(f"{c.get(col, 0):>12d}" for col in cols))
+
+    print("\nSeeded vs unstratified holdout - the size of the selection bias:")
+    for k, c in by_selection.items():
+        if sum(c.values()):
+            print(f"   {k:8s} n={sum(c.values()):3d}  " + "  ".join(
+                f"{col}={c.get(col, 0)}" for col in cols if c.get(col)))
 
     consistency_pct = 100.0
     if a.repeat > 1:
@@ -528,11 +755,17 @@ def main() -> int:
     rep0 = tallies[0].report()
     print("\n" + "=" * 70)
     print("Automated Metrics Evaluation (Tasks/medgemma_extraction_test.md §Automated metrics):")
-    qv_status = "GOOD (≥95%)" if rep0["quote_verified_pct"] >= 95 else ("WORKABLE (85-95%)" if rep0["quote_verified_pct"] >= 85 else "CONCERNING (<85%)")
+    def band(v, good, workable):
+        return f"GOOD (≥{good}%)" if v >= good else (f"WORKABLE ({workable}-{good}%)" if v >= workable else f"CONCERNING (<{workable}%)")
+    qv_quoted = rep0["quote_verified_pct_of_quoted"]
+    qv_status = band(qv_quoted, 95, 85)
     cs_status = "GOOD (≥98%)" if consistency_pct >= 98 else ("WORKABLE (90-98%)" if consistency_pct >= 90 else "CONCERNING (<90%)")
     iv_pct = 100 * rep0["invalid_value"] / (rep0["proposed"] or 1)
     iv_status = "GOOD (≤2%)" if iv_pct <= 2 else ("WORKABLE (2-10%)" if iv_pct <= 10 else "CONCERNING (>10%)")
-    print(f"  - Quote-verified %:        {rep0['quote_verified_pct']}% -> {qv_status}")
+    print(f"  - Quote-verified % (of quoted proposals):  {qv_quoted}% -> {qv_status}")
+    print(f"  - Quote-verified % (of ALL proposals):     {rep0['quote_verified_pct']}%")
+    print(f"  - Null-placeholder rate:   {rep0['null_placeholder_pct']}% -> "
+          f"{'GOOD (≤5%)' if rep0['null_placeholder_pct'] <= 5 else 'CONCERNING - the prompt omission rule is being ignored'}")
     print(f"  - Run-to-run consistency:  {consistency_pct}% -> {cs_status}")
     print(f"  - Invalid-value rate:      {iv_pct:.1f}% -> {iv_status}")
     print(f"  - Unparseable replies:     {rep0['unparseable_replies']} -> {'GOOD (0)' if rep0['unparseable_replies']==0 else 'CONCERNING'}")
@@ -556,6 +789,8 @@ def main() -> int:
                 }
             detailed_records.append({
                 "patient_uid": uid,
+                "selection": selection[uid],          # seeded:<outcome> | holdout | random
+                "scd_primary": is_scd_primary(rec),   # a label now, not a filter
                 "title": rec.get("title", ""),
                 "age": rec.get("age"),
                 "gender": rec.get("gender"),
@@ -573,6 +808,9 @@ def main() -> int:
                 "model_digest": model_digest,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "notes_count": len(notes),
+                "cohort": a.cohort,
+                "stratified": a.stratify,
+                "holdout_frac": a.holdout_frac if a.stratify else None,
                 "outcomes": outcomes,
                 "repeat": a.repeat,
             },
@@ -586,8 +824,17 @@ def main() -> int:
                 "completion_tokens_per_sec": round(tallies[0].completion_tokens / tallies[0].wall_clock_sec, 1) if tallies[0].wall_clock_sec > 0 else 0,
             },
             "automated_metrics": {
+                "proposed": rep0["proposed"],
+                "quoted": rep0["quoted"],
+                "quote_verified": rep0["quote_verified"],
+                "quote_unfound": rep0["quote_unfound"],
+                "null_placeholder": rep0["null_placeholder"],
+                "null_placeholder_pct": rep0["null_placeholder_pct"],
                 "quote_verified_pct": rep0["quote_verified_pct"],
+                "quote_verified_pct_of_quoted": rep0["quote_verified_pct_of_quoted"],
                 "hallucinated_quote_pct": rep0["hallucinated_quote_pct"],
+                "hallucinated_pct_of_quoted": rep0["hallucinated_pct_of_quoted"],
+                "tokenizer_artifacts": rep0["tokenizer_artifacts"],
                 "invalid_value_count": rep0["invalid_value"],
                 "invalid_value_pct": round(iv_pct, 1),
                 "unparseable_replies": rep0["unparseable_replies"],
@@ -595,6 +842,8 @@ def main() -> int:
             },
             "runs": [t.report() for t in tallies],
             "grade_status": dict(statuses),
+            "grade_status_by_outcome": {k: dict(v) for k, v in by_outcome.items()},
+            "grade_status_by_selection": {k: dict(v) for k, v in by_selection.items() if sum(v.values())},
             "features_extracted": dict(tallies[0].per_feature),
             "detailed_records": detailed_records,
         }
