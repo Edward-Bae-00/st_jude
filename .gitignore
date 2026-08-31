@@ -25,3 +25,7 @@ scripts/audit/grade_diffs.json
 env/
 venv/
 *.log
+
+# Generated review sheets (regenerated per run; a stale one silently
+# describes a different run than the results file beside it)
+results/*.csv

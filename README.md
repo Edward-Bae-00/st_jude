@@ -187,11 +187,14 @@ python scripts\experiments\medgemma_extraction.py --tier full --backend openai -
 
 The extraction harness automatically calculates:
 
-- **Quote-verified %:** Measures whether proposed features carry a verbatim quote directly present in the note (catches hallucinations).
-- **Run-to-run consistency:** Measures output determinism at temperature 0 across repeated runs.
+- **Quote-verified %:** Measures whether proposed features carry a verbatim quote directly present in the note (catches hallucinations). **This is a grounding check, not precision.** It asks whether the quoted words are in the note; it cannot ask whether they *support* the value. `fio2_pct = 21` quoting *"the patient needed increasing oxygen by nasal cannula"* verifies at 100%. Precision is a human judgement and comes only from the hand-check sheet's `supports_value` column.
+- **Unit guard:** For a numeric feature whose schema declares a convertible unit, the number is read out of its own verified quote, in the unit the note wrote it in, and converted. A note using mg/L throughout otherwise puts `7.0` into an mg/dL creatinine field — a 10× error no type check can see. A value matching neither its quote's number nor that number's conversion is rejected and counted.
+- **Value conflicts:** One `(note, outcome)` routinely yields several verified values for one feature — a note carries five creatinines across twelve years and one of them belongs to the transplant donor. Where the schema states an aggregation ("Highest level of care this event actually reached") the values collapse by it; where it does not, the disagreement is reported and the feature is withheld from grading rather than resolved by emission order.
+- **Run-to-run consistency:** Measures output determinism at temperature 0 across repeated runs. At `--concurrency 1` with greedy decoding, 100% is the *expected* result — it is a smoke test for a nondeterministic serving stack, not evidence about the model.
 - **Invalid-value rate:** Detects values outside declared types or enums.
 - **Unparseable replies:** Tracks any malformed JSON generations.
-- **SCOGS Decision Table Grading:** Evaluates extracted features through the official SCOGS logic (outcomes: `graded`, `absent`, `grade_set`, or `cannot_grade`).
+- **SCOGS Decision Table Grading:** Evaluates extracted features through the official SCOGS logic (outcomes: `graded`, `absent`, `refuted`, `grade_set`, or `cannot_grade`). `refuted` is split out of `absent`: the model *did* evidence the outcome and the decision tables overruled the call (a 36.5 °C "fever"). Pooled with `absent` it sends a reviewer to confirm an absence the rule engine, not the model, produced.
+- **Provenance & `run_id`:** Every result file carries a `run_id`, and every review sheet generated from it stamps that id on each row. A filled-in sheet that has drifted apart from its results file is worse than no sheet, because the review hours land on the wrong run and nothing says so.
 - **Throughput & Profiling:** Wall-clock time, tokens/second, and tokens per note.
 
 All detailed extractions and clinical note text are saved to the JSON file specified by `--out` (e.g. `results/full.json` or `results/local.json`).
