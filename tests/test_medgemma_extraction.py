@@ -8,8 +8,9 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts" / "experiments"))
 from medgemma_extraction import (  # noqa: E402
-    Tally, build_prompt, coerce, is_scd_primary, normalize, outcome_seed,
-    call_mock, scd_mentions, select_notes, verify,
+    Tally, build_prompt, coerce, harness_status, is_scd_primary, normalize,
+    outcome_seed, call_mock, reconcile, reduce_policy, scd_mentions,
+    select_notes, unit_guard, verify,
 )
 
 NOTE = ("A 14-year-old with HbSS presented with chest pain. FiO2 was escalated to 60%. "
@@ -18,7 +19,7 @@ NOTE = ("A 14-year-old with HbSS presented with chest pain. FiO2 was escalated t
 
 def run_verify(findings, present=True, note=NOTE):
     t = Tally()
-    feats, p = verify(json.dumps({"present": present, "findings": findings}), note, t)
+    feats, p, _ = verify(json.dumps({"present": present, "findings": findings}), note, t)
     return feats, p, t
 
 
@@ -87,7 +88,7 @@ def test_a_valid_quote_with_an_invalid_value_is_still_rejected():
 
 def test_unparseable_reply_is_counted_not_raised():
     t = Tally()
-    feats, present = verify("here is my answer, thanks!", NOTE, t)
+    feats, present, _ = verify("here is my answer, thanks!", NOTE, t)
     assert feats == {} and present is None and t.bad_json == 1
 
 
@@ -273,3 +274,185 @@ def test_the_mock_exercises_the_absent_path_too():
         for num in ("28", "48", "36", "19"):
             seen.add(json.loads(call_mock(build_prompt(note, num), "", ""))["present"])
     assert seen == {True, False}
+
+
+# ------------------------------------------------------------------ unit guard
+#
+# `coerce` only ever asked whether a value parses as a float. The schema declares
+# the unit; the verified quote says which unit the number was written in. When
+# those disagree the number is wrong by a factor, and nothing downstream can see it.
+
+CREAT_NOTE = ("Bicarbonate reserves were 15.69 mmol/L. Serum creatinine was at 7 mg/L, "
+              "calcemia at 90 mg/L. On readmission creatinine 1.8 mg dl-1 was recorded, "
+              "and a repeat creatinine of 250 umol/L followed.")
+FEVER_NOTE = ("She developed fever (102.6 Fahrenheit) overnight. "
+              "Her initial vital signs showed a temperature of 38.1 \u00b0C.")
+
+
+def test_a_value_written_in_another_unit_is_converted_not_taken_at_face_value():
+    """The real failure: a note using mg/L throughout put 7.0 into an mg/dL field,
+    a 10x overstatement that grades an AKI at its ceiling."""
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 7,
+                               "quote": "Serum creatinine was at 7 mg/L"}],
+                             note=CREAT_NOTE)
+    assert feats == {"creatinine": 0.7} and t.unit_converted == 1
+
+
+def test_a_value_already_in_the_declared_unit_is_untouched():
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 1.8,
+                               "quote": "creatinine 1.8 mg dl-1"}], note=CREAT_NOTE)
+    assert feats == {"creatinine": 1.8} and t.unit_converted == 0
+
+
+def test_si_creatinine_is_converted_by_its_molar_mass():
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 250,
+                               "quote": "a repeat creatinine of 250 umol/L"}],
+                             note=CREAT_NOTE)
+    assert feats["creatinine"] == round(250 / 88.4, 4) and t.unit_converted == 1
+
+
+def test_fahrenheit_is_converted_from_the_quote_not_from_the_model_arithmetic():
+    """The model copies the number across without the unit: 102.6 into a degC field."""
+    feats, _, t = run_verify([{"feature": "temperature", "value": 102.6,
+                               "quote": "fever (102.6 Fahrenheit)"}], note=FEVER_NOTE)
+    assert feats == {"temperature": 39.2222} and t.unit_converted == 1
+
+
+def test_a_botched_conversion_is_rejected_rather_than_re_converted():
+    """The model read '102.6 Fahrenheit' and wrote 38.9. It is 39.2, and 38.9 is on
+    the far side of a grade boundary. The value matches neither the quote's number
+    nor its conversion, so there is nothing here to trust and nothing to repair."""
+    feats, _, t = run_verify([{"feature": "temperature", "value": 38.9,
+                               "quote": "fever (102.6 Fahrenheit)"}], note=FEVER_NOTE)
+    assert feats == {} and t.quote_value_mismatch == 1 and t.unit_converted == 0
+
+
+def test_a_correct_conversion_is_accepted_and_canonicalised():
+    feats, _, t = run_verify([{"feature": "temperature", "value": 39.2,
+                               "quote": "fever (102.6 Fahrenheit)"}], note=FEVER_NOTE)
+    assert feats == {"temperature": 39.2222} and t.quote_value_mismatch == 0
+
+
+def test_celsius_in_a_celsius_field_is_left_alone():
+    feats, _, t = run_verify([{"feature": "temperature", "value": 38.1,
+                               "quote": "a temperature of 38.1 \u00b0C"}], note=FEVER_NOTE)
+    assert feats == {"temperature": 38.1} and t.unit_converted == 0
+
+
+def test_a_number_that_is_not_the_one_in_its_own_quote_is_rejected():
+    """The quote verifies - the words are all in the note - and still does not
+    support the value. Where a unit anchors a number, that much is checkable."""
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 1.9,
+                               "quote": "creatinine 1.8 mg dl-1"}], note=CREAT_NOTE)
+    assert feats == {} and t.quote_value_mismatch == 1
+
+
+def test_a_quote_carrying_several_units_is_left_alone_not_guessed_at():
+    note = "Creatinine was 1.8 mg/dL, having been 250 umol/L on admission."
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 1.8,
+                               "quote": "Creatinine was 1.8 mg/dL, having been 250 umol/L"}],
+                             note=note)
+    # two different unit tokens: which one belongs to this number is not decidable
+    assert feats == {"creatinine": 1.8} and t.unit_ambiguous == 1 and t.unit_converted == 0
+
+
+def test_an_unconvertible_unit_is_rejected_rather_than_accepted_at_face_value():
+    feats, _, t = run_verify([{"feature": "creatinine", "value": 15.69,
+                               "quote": "Bicarbonate reserves were 15.69 mmol/L"}],
+                             note=CREAT_NOTE)
+    assert feats == {} and t.unit_mismatch == 1
+
+
+def test_a_feature_with_no_convertible_unit_family_is_never_touched():
+    """fio2_pct is a percentage and the schema sanctions 'room air' -> 21, which no
+    quote spells out as a number. The guard has no business here."""
+    assert unit_guard("fio2_pct", 60.0, "FiO2 was escalated to 60%") == ("ok", 60.0, None)
+    assert unit_guard("fio2_pct", 21.0, "on room air") == ("ok", 21.0, None)
+    assert unit_guard("patient_age", 30.0, "A 30-year-old female") == ("ok", 30.0, None)
+
+
+# ------------------------------------------------------- multi-value reconciliation
+#
+# One (note, outcome) routinely yields several verified values for one feature.
+# `out[name] = val` in a loop picked whichever the model emitted last.
+
+def test_an_ordinal_collapses_to_its_schema_declared_extreme():
+    """care_setting is 'Highest level of care this event actually reached', and its
+    values are declared low-to-high. A note with five settings has one answer."""
+    assert reconcile("care_setting", ["inpatient", "home", "ed_treat_release"]) \
+        == ("inpatient", None)
+    assert reconcile("resp_support", ["room_air", "low_flow_o2"]) == ("low_flow_o2", None)
+    assert reconcile("transfusion_type", ["exchange", "simple"]) == ("exchange", None)
+
+
+def test_emission_order_no_longer_decides_the_value():
+    """The same three settings in the order that used to produce the wrong answer."""
+    assert reconcile("care_setting", ["inpatient", "inpatient", "ed_treat_release"]) \
+        == ("inpatient", None)
+
+
+def test_a_numeric_feature_that_declares_an_extreme_collapses_to_it():
+    assert reconcile("temperature", [37.0, 38.5, 36.9]) == (38.5, None)
+    assert reconcile("fio2_pct", [21.0, 80.0]) == (80.0, None)
+
+
+def test_a_feature_with_no_aggregation_rule_reports_a_conflict_instead_of_guessing():
+    """Five creatinines across twelve years, one of them the transplant donor's.
+    There is no rule that says which is 'the' creatinine, so none is invented."""
+    value, clash = reconcile("creatinine", [0.9, 1.0, 1.6, 1.8])
+    assert value is None and clash == [0.9, 1.0, 1.6, 1.8]
+
+
+def test_repeated_identical_values_are_not_a_conflict():
+    assert reconcile("creatinine", [1.8, 1.8, 1.8]) == (1.8, None)
+    assert reconcile("patient_age", [30.0]) == (30.0, None)
+
+
+def test_a_conflicted_feature_is_withheld_from_grading_and_reported():
+    note = ("Creatinine at the time of explant was 0.9 mg/dl. "
+            "Her kidney function was stable, with creatinine values of 1.6 mg/dl.")
+    feats, _, t = run_verify([
+        {"feature": "creatinine", "value": 0.9,
+         "quote": "Creatinine at the time of explant was 0.9 mg/dl"},
+        {"feature": "creatinine", "value": 1.6,
+         "quote": "creatinine values of 1.6 mg/dl"},
+    ], note=note)
+    assert feats == {}                      # never silently 1.6
+    assert t.value_conflicts == 1
+    assert t.accepted == 2                  # both cleared §2; the disagreement is downstream
+
+
+def test_the_detail_payload_carries_what_the_review_sheets_are_built_from():
+    """The sheets read this instead of re-deriving acceptance, which is how a
+    hand-check sheet ends up listing 42 rows for a run that accepted 46."""
+    t = Tally()
+    _, _, detail = verify(json.dumps({"present": True, "findings": [
+        {"feature": "fio2_pct", "value": 60, "quote": "FiO2 was escalated to 60%"},
+        {"feature": "fio2_pct", "value": 90, "quote": "FiO2 was escalated to 90%"},
+    ]}), NOTE, t)
+    assert [f["feature"] for f in detail["accepted"]] == ["fio2_pct"]
+    assert detail["accepted"][0]["value"] == 60.0 and detail["conflicts"] == {}
+
+
+def test_reduce_policy_is_read_off_the_schema_not_hardcoded():
+    assert reduce_policy("care_setting") == "max"       # "Highest level of care..."
+    assert reduce_policy("resp_support") == "max"       # "Maximum respiratory support..."
+    assert reduce_policy("transfusion_type") == "max"   # "Most intensive..."
+    assert reduce_policy("temperature") == "max"        # "Highest documented..."
+    assert reduce_policy("creatinine") is None          # "Serum creatinine." - no rule
+    assert reduce_policy("patient_age") is None
+
+
+# ------------------------------------------------- absent vs rules-refuted
+
+def test_an_absence_the_rules_produced_is_not_an_absence_the_model_produced():
+    """A 36.5 degC 'fever': the model said present, the tables overruled it. Pooled
+    into `absent` it sends a reviewer to confirm an absence the model never asserted."""
+    assert harness_status("absent", True) == "refuted"
+    assert harness_status("absent", False) == "absent"
+    assert harness_status("absent", None) == "absent"
+
+
+def test_every_other_status_passes_through_untouched():
+    for st in ("graded", "grade_set", "cannot_grade", "not_applicable"):
+        assert harness_status(st, True) == st and harness_status(st, False) == st

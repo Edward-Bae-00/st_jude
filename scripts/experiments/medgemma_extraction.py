@@ -165,6 +165,27 @@ def get_model_info(model: str, host: str) -> dict:
         return {}
 
 
+# `general.file_type` is a GGUF quantisation enum, not an identity. Recording it as
+# the digest answered "which weights ran?" with the number 1.
+GGUF_FILE_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0",
+                   9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L",
+                   14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+                   30: "BF16"}
+
+
+def get_model_digest(model: str, host: str) -> str:
+    """The content hash Ollama holds for these weights - the only field that actually
+    identifies what ran. /api/show does not return it; /api/tags does."""
+    try:
+        with urllib.request.urlopen(f"{host.rstrip('/')}/api/tags", timeout=10) as r:
+            for m in json.loads(r.read().decode("utf-8")).get("models", []):
+                if m.get("name") in (model, f"{model}:latest"):
+                    return m.get("digest", "")
+    except Exception:
+        pass
+    return ""
+
+
 def call_ollama(prompt: str, model: str, host: str, stats: dict | None = None,
                 timeout: int = 300, **kwargs) -> str:
     # keep_alive -1 pins the model in VRAM. Without it Ollama unloads after 5 idle
@@ -332,6 +353,163 @@ def normalize(s: str) -> str:
     return s.strip().lower()
 
 
+# ---------------------------------------------------------- units & aggregation
+
+# A `num` feature declares its unit in the schema, but `coerce` only ever checked
+# that the value parses as a float. A note reading "serum creatinine was at 7 mg/L"
+# therefore landed 7.0 in an mg/dL field - a 10x error that grades an AKI at its
+# ceiling, and that no type check can see. The quote is already verified verbatim
+# against the note, so it is the one trustworthy place to read the unit the number
+# was actually written in.
+UNIT_TOKENS = {
+    "mg/dl":  r"mg\s*/\s*dl|mg\s+dl\s*(?:\u2212|-)?\s*1|milligrams?\s+per\s+decilit",
+    "mg/l":   r"mg\s*/\s*l(?![a-z/])|mg\s+l\s*(?:\u2212|-)?\s*1|milligrams?\s+per\s+lit",
+    "umol/l": r"[\u00b5u]mol\s*/\s*l|micromol",
+    "mmol/l": r"mmol\s*/\s*l|millimol",
+    "g/dl":   r"(?<![a-z])g\s*/\s*dl|grams?\s+per\s+decilit",
+    "g/l":    r"(?<![a-z])g\s*/\s*l(?![a-z/])|grams?\s+per\s+lit",
+    "degf":   r"\u00b0\s*f\b|\u00ba\s*f\b|\bfahrenheit",
+    "degc":   r"\u00b0\s*c\b|\u00ba\s*c\b|\bcelsius|\bcentigrade",
+}
+
+# Keyed by the unit the SCHEMA declares, so a factor can never be applied to a
+# feature it was not derived for. The umol/L -> mg/dL divisor is creatinine's
+# molar mass; mg/dL is declared only by creatinine features, which is what makes
+# it safe to sit in this table. Add a unit here only with the same guarantee.
+UNIT_CONVERSIONS = {
+    "mg/dL": {"mg/dl": lambda v: v,
+              "mg/l":  lambda v: v / 10.0,
+              "umol/l": lambda v: v / 88.4},
+    "g/dL":  {"g/dl": lambda v: v,
+              "g/l":  lambda v: v / 10.0},
+    "degC":  {"degc": lambda v: v,
+              "degf": lambda v: (v - 32.0) * 5.0 / 9.0},
+}
+
+UNIT_OK, UNIT_CONVERTED, UNIT_AMBIGUOUS = "ok", "converted", "ambiguous"
+UNIT_BAD, UNIT_VALUE_MISMATCH = "bad", "value_mismatch"
+
+# Decimal point only. A comma here would read a thousands separator as a decimal.
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _number_for_unit(q: str, pat: str):
+    """The number the unit token is attached to - the nearest one before it, else
+    the first after. -> float | None."""
+    m = re.search(pat, q, re.I)
+    if not m:
+        return None
+    before = NUMBER.findall(q[:m.start()])
+    if before:
+        return float(before[-1])
+    after = NUMBER.search(q[m.end():])
+    return float(after.group()) if after else None
+
+
+def _agrees(a: float, b: float) -> bool:
+    """Tight on purpose. 38.9 against 39.2 is 0.8% and straddles a grade boundary,
+    so anything loose enough to call those equal defeats the check."""
+    return abs(a - b) <= max(abs(b), abs(a), 1.0) * 0.005
+
+
+def unit_guard(name: str, value: float, quote: str):
+    """-> (status, value, detail). Reconcile a number against its own verified quote.
+
+    The quote is the authority, not the value: the model may already have tried the
+    conversion and botched it ("102.6 Fahrenheit" -> 38.9, which is 39.2 and lands on
+    the far side of a grade boundary). So the number is read out of the quote, next
+    to the unit it is written in, and converted from there.
+
+    Silence is the default. No recognisable unit in the quote, several of them, or no
+    number beside one, and the value is returned untouched - this guard only speaks
+    where the note itself said what unit it meant.
+    """
+    declared = FEATURES[name].get("unit")
+    table = UNIT_CONVERSIONS.get(declared)
+    if not table:
+        return UNIT_OK, value, None       # no unit declared, or no family for it
+    q = normalize(quote)
+    found = [u for u, pat in UNIT_TOKENS.items() if re.search(pat, q, re.I)]
+    if not found:
+        return UNIT_OK, value, None
+    if len(found) > 1:
+        return UNIT_AMBIGUOUS, value, "/".join(sorted(found))
+    src = found[0]
+    if src not in table:
+        return UNIT_BAD, None, f"{src} is not convertible to {declared}"
+    raw = _number_for_unit(q, UNIT_TOKENS[src])
+    if raw is None:
+        return UNIT_OK, value, None       # a unit, but no number to anchor it to
+    truth = round(table[src](raw), 4)
+    if _agrees(value, truth):
+        return UNIT_OK, truth, None       # already right; canonicalise the rounding
+    if _agrees(value, raw):
+        # the number was copied across without the unit coming with it
+        return UNIT_CONVERTED, truth, f"{raw} {src} -> {truth} {declared}"
+    return UNIT_VALUE_MISMATCH, None, (
+        f"value {value} is neither the quote's {raw} {src} nor its {truth} {declared}")
+
+
+# How to collapse several verified proposals for one feature into the single value
+# the decision tables take. The schema already answers this: `ord` values are listed
+# low-to-high and compare by rank, and the definitions say which end wins ("Highest
+# level of care this event actually reached", "Maximum respiratory support given").
+# Reading the policy off the definition keeps this file from re-stating the contract.
+AGG_MAX = re.compile(r"\bhighest\b|\bmaximum\b|\bmax\b|\bpeak\b|\bworst\b|\bmost intensive\b", re.I)
+AGG_MIN = re.compile(r"\blowest\b|\bminimum\b|\bnadir\b", re.I)
+
+
+def reduce_policy(name: str) -> str | None:
+    """-> 'max' | 'min' | None, read off the feature's own definition."""
+    if FEATURES[name]["type"] == "cat":
+        return None                       # unordered: no defensible winner
+    d = FEATURES[name]["definition"]
+    if AGG_MAX.search(d): return "max"
+    if AGG_MIN.search(d): return "min"
+    return None
+
+
+def _rank(name: str, v):
+    spec = FEATURES[name]
+    if spec["type"] == "ord":
+        return (spec["values"] or []).index(v)
+    return v
+
+
+def harness_status(rule_status: str, present) -> str:
+    """-> the status the harness reports, which splits one of the engine's.
+
+    `absent` pools two different findings: the model never evidenced the outcome,
+    and the model DID evidence it but the tables overruled the call (a 36.5 degC
+    "fever"). Pooled, the second kind lands in the absence audit, where it asks a
+    reviewer to confirm an absence that the rule engine, not the model, produced.
+    """
+    return "refuted" if rule_status == "absent" and present else rule_status
+
+
+def reconcile(name: str, values: list):
+    """-> (value, conflict). Several quoted values for one feature is the norm, not
+    an edge case: a note carries five creatinines across twelve years, and one of
+    them belongs to the transplant donor. Overwriting until the last one wins picks
+    by emission order, silently. Where the schema states an aggregation the values
+    collapse by it; where it does not, disagreement is a conflict that is reported
+    and withheld, never guessed at.
+    """
+    uniq = []
+    for v in values:
+        if v not in uniq: uniq.append(v)
+    if len(uniq) == 1:
+        return uniq[0], None
+    policy = reduce_policy(name)
+    if policy is None:
+        return None, uniq
+    pick = max if policy == "max" else min
+    try:
+        return pick(uniq, key=lambda v: _rank(name, v)), None
+    except (ValueError, TypeError):
+        return None, uniq
+
+
 @dataclass
 class Tally:
     proposed: int = 0
@@ -343,6 +521,11 @@ class Tally:
     accepted: int = 0
     bad_json: int = 0
     tokenizer_artifacts: int = 0   # quotes carrying corrupt-GGUF byte tokens
+    unit_converted: int = 0        # value rewritten into the schema's unit
+    unit_ambiguous: int = 0        # quote carried several units -> left alone
+    unit_mismatch: int = 0         # quote's unit cannot reach the declared one
+    quote_value_mismatch: int = 0  # number is not the one its own quote carries
+    value_conflicts: int = 0       # several verified values, no aggregation rule
     per_feature: Counter = field(default_factory=Counter)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -368,6 +551,11 @@ class Tally:
             "hallucinated_quote_pct": round(100 * self.quote_unfound / p, 1),
             "hallucinated_pct_of_quoted": round(100 * self.quote_unfound / q, 1),
             "tokenizer_artifacts": self.tokenizer_artifacts,
+            "unit_converted": self.unit_converted,
+            "unit_ambiguous": self.unit_ambiguous,
+            "unit_mismatch": self.unit_mismatch,
+            "quote_value_mismatch": self.quote_value_mismatch,
+            "value_conflicts": self.value_conflicts,
             "missing_quote": self.quote_missing,
             "invalid_value": self.value_bad,
             "unknown_feature": self.unknown_feature,
@@ -395,14 +583,28 @@ def coerce(name: str, value):
     return (True, v) if v in (spec["values"] or []) else (False, None)
 
 
-def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None]:
+def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None, dict]:
+    """-> (features, present, detail).
+
+    `detail` carries every accepted finding and every unresolved conflict for this
+    one (note, outcome). The review sheets are built from it rather than re-deriving
+    acceptance downstream, which is how a hand-check sheet ends up disagreeing with
+    the harness that produced it.
+
+    A verified quote means the words are in the note. It does NOT mean the words
+    support the value - "needed increasing oxygen by nasal cannula" verifies
+    perfectly behind fio2_pct=21. That judgement is human, and it is what the
+    hand-check sheet's `supports_value` column exists to record.
+    """
+    empty = {"accepted": [], "conflicts": {}}
     try:
         data = json.loads(reply)
     except json.JSONDecodeError:
         tally.bad_json += 1
-        return {}, None
+        return {}, None, empty
     hay = normalize(note)
-    out = {}
+    cand: dict[str, list] = {}
+    accepted: list[dict] = []
     for f in data.get("findings", []) or []:
         tally.proposed += 1
         name = f.get("feature")
@@ -423,10 +625,35 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None]:
         if not ok:
             tally.value_bad += 1
             continue
-        out[name] = val
+        unit_detail = None
+        if FEATURES[name]["type"] == "num":
+            status, converted, unit_detail = unit_guard(name, val, quote)
+            if status == UNIT_BAD:
+                tally.unit_mismatch += 1
+                continue
+            if status == UNIT_VALUE_MISMATCH:
+                tally.quote_value_mismatch += 1
+                continue
+            if status == UNIT_AMBIGUOUS:
+                tally.unit_ambiguous += 1
+            elif status == UNIT_CONVERTED:
+                tally.unit_converted += 1
+            val = converted
+        cand.setdefault(name, []).append(val)
+        accepted.append({"feature": name, "value": val, "quote": quote,
+                         "unit": unit_detail})
         tally.accepted += 1
         tally.per_feature[name] += 1
-    return out, data.get("present")
+
+    out, conflicts = {}, {}
+    for name, vals in cand.items():
+        picked, clash = reconcile(name, vals)
+        if clash is not None:
+            conflicts[name] = clash
+            tally.value_conflicts += 1
+            continue
+        out[name] = picked
+    return out, data.get("present"), {"accepted": accepted, "conflicts": conflicts}
 
 
 # ------------------------------------------------------------------------ main
@@ -646,8 +873,8 @@ def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300,
     results = {}
     for i, (rec, num) in enumerate(tasks):
         reply = replies[i] or ""
-        feats, present = verify(reply, rec["patient"], tally)
-        results.setdefault(rec["patient_uid"], {})[num] = (feats, present, reply)
+        feats, present, detail = verify(reply, rec["patient"], tally)
+        results.setdefault(rec["patient_uid"], {})[num] = (feats, present, reply, detail)
 
     for part in stats_parts:
         if part:
@@ -713,7 +940,15 @@ def main() -> int:
     notes, selection = select_notes(pool, a.notes, outcomes,
                                     holdout_frac=a.holdout_frac, stratify=a.stratify)
     model_info = get_model_info(model, a.host) if a.backend == "ollama" else {}
-    model_digest = model_info.get("details", {}).get("parent_model", "") or model_info.get("model_info", {}).get("general.file_type", "")
+    model_digest = (get_model_digest(model, a.host) if a.backend == "ollama" else "") \
+        or model_info.get("details", {}).get("parent_model", "")
+    file_type = model_info.get("model_info", {}).get("general.file_type")
+    if a.backend == "hf":
+        served_quant = a.quant
+    elif file_type is None:
+        served_quant = None
+    else:
+        served_quant = GGUF_FILE_TYPES.get(file_type, f"file_type_{file_type}")
 
     print("=" * 70)
     print(f"P11 MedGemma Extraction Test")
@@ -757,7 +992,20 @@ def main() -> int:
         print(f"    quote verified:     {t.quote_ok:4d}  {rep['quote_verified_pct_of_quoted']:5.1f}% of quoted | {rep['quote_verified_pct']:.1f}% of all")
         print(f"    quote not in note:  {t.quote_unfound:4d}  {rep['hallucinated_pct_of_quoted']:5.1f}% of quoted | {rep['hallucinated_quote_pct']:.1f}% of all")
         print(f"  Accepted findings:    {rep['accepted']}")
+        print(f"     ^ a verified quote means the words are in the note, NOT that they")
+        print(f"       support the value. Precision needs the hand-check sheet.")
         print(f"  Invalid values:       {rep['invalid_value']}")
+        if rep['unit_converted'] or rep['unit_mismatch'] or rep['unit_ambiguous']:
+            print(f"  Unit guard:           {rep['unit_converted']} converted into the "
+                  f"schema's unit, {rep['unit_mismatch']} rejected as unconvertible, "
+                  f"{rep['unit_ambiguous']} left alone (quote carried several units)")
+        if rep['quote_value_mismatch']:
+            print(f"  Number not in quote:  {rep['quote_value_mismatch']} rejected - the "
+                  f"value is neither the number its quote carries nor its conversion")
+        if rep['value_conflicts']:
+            print(f"  !! VALUE CONFLICTS:   {rep['value_conflicts']} feature(s) had several "
+                  f"verified values and no aggregation rule.")
+            print(f"     Withheld from grading rather than guessed at; listed per note in --out.")
         if rep['tokenizer_artifacts']:
             print(f"  !! TOKENIZER ARTIFACTS: {rep['tokenizer_artifacts']} quotes carry corrupt GGUF byte tokens.")
             print(f"     The served weights are broken; these numbers are not a clean measurement.")
@@ -774,11 +1022,17 @@ def main() -> int:
         grade_results_detail[uid] = {}
         for num, (feats, present, *_) in per.items():
             res = grade(num, feats, present=bool(present))
-            statuses[res.status] += 1
-            by_outcome[num][res.status] += 1
-            by_selection[selection[uid].split(":")[0]][res.status] += 1
+            # "the model never saw this outcome" and "the model called it and the
+            # tables overruled the call" are different questions. Pooled as one
+            # `absent` they send a reviewer to confirm an absence the rule engine
+            # produced, on a note where the model actually said present.
+            status = harness_status(res.status, present)
+            statuses[status] += 1
+            by_outcome[num][status] += 1
+            by_selection[selection[uid].split(":")[0]][status] += 1
             grade_results_detail[uid][num] = {
-                "status": res.status,
+                "status": status,
+                "rule_status": res.status,
                 "grade": res.grade,
                 "features": feats,
                 "present": present,
@@ -789,7 +1043,7 @@ def main() -> int:
     for k, v in statuses.most_common():
         print(f"   {k:14s} {v:3d} ({100*v/(len(notes)*len(outcomes)):.1f}%)")
 
-    cols = ["graded", "grade_set", "cannot_grade", "absent", "not_applicable"]
+    cols = ["graded", "grade_set", "cannot_grade", "absent", "refuted", "not_applicable"]
     print(f"\nPer outcome (n={len(notes)} each) - a pooled number hides this shape:")
     print(f"   {'':>3s} {'outcome':30s} " + " ".join(f"{c[:12]:>12s}" for c in cols))
     for num in outcomes:
@@ -803,7 +1057,7 @@ def main() -> int:
             print(f"   {k:8s} n={sum(c.values()):3d}  " + "  ".join(
                 f"{col}={c.get(col, 0)}" for col in cols if c.get(col)))
 
-    consistency_pct = 100.0
+    consistency_pct = None
     if a.repeat > 1:
         same = tot = 0
         for uid in runs[0]:
@@ -813,6 +1067,10 @@ def main() -> int:
         consistency_pct = round(100 * same / tot, 1)
         print(f"\nTemperature-0 consistency across runs 1-{a.repeat}: {consistency_pct}% "
               f"({same}/{tot} note-outcome pairs identical)")
+        if a.concurrency == 1:
+            print("   At --concurrency 1 with greedy decoding this is close to a tautology:")
+            print("   100% is the expected result and evidences nothing about the model.")
+            print("   It is a smoke test for a nondeterministic serving stack, not a metric.")
 
     # Threshold assessment
     rep0 = tallies[0].report()
@@ -822,15 +1080,33 @@ def main() -> int:
         return f"GOOD (≥{good}%)" if v >= good else (f"WORKABLE ({workable}-{good}%)" if v >= workable else f"CONCERNING (<{workable}%)")
     qv_quoted = rep0["quote_verified_pct_of_quoted"]
     qv_status = band(qv_quoted, 95, 85)
-    cs_status = "GOOD (≥98%)" if consistency_pct >= 98 else ("WORKABLE (90-98%)" if consistency_pct >= 90 else "CONCERNING (<90%)")
+    if consistency_pct is None:
+        cs_status = "NOT MEASURED (needs --repeat 2)"
+    elif consistency_pct < 90:
+        cs_status = "CONCERNING (<90%)"
+    elif consistency_pct < 98:
+        cs_status = "WORKABLE (90-98%)"
+    elif a.concurrency == 1:
+        cs_status = "EXPECTED - greedy and unbatched; a near-tautology, not evidence"
+    else:
+        cs_status = "GOOD (≥98%) and meaningful - it held under batching"
     iv_pct = 100 * rep0["invalid_value"] / (rep0["proposed"] or 1)
     iv_status = "GOOD (≤2%)" if iv_pct <= 2 else ("WORKABLE (2-10%)" if iv_pct <= 10 else "CONCERNING (>10%)")
     print(f"  - Quote-verified % (of quoted proposals):  {qv_quoted}% -> {qv_status}")
     print(f"  - Quote-verified % (of ALL proposals):     {rep0['quote_verified_pct']}%")
+    print(f"      NB: quote-verified is a GROUNDING check, not precision. It asks only")
+    print(f"      whether the quoted words appear in the note - a quote that does not")
+    print(f"      support its value passes it. Precision comes from the hand-check sheet.")
     print(f"  - Null-placeholder rate:   {rep0['null_placeholder_pct']}% -> "
           f"{'GOOD (≤5%)' if rep0['null_placeholder_pct'] <= 5 else 'CONCERNING - the prompt omission rule is being ignored'}")
-    print(f"  - Run-to-run consistency:  {consistency_pct}% -> {cs_status}")
+    cs_value = "  n/a" if consistency_pct is None else f"{consistency_pct}%"
+    print(f"  - Run-to-run consistency:  {cs_value} -> {cs_status}")
     print(f"  - Invalid-value rate:      {iv_pct:.1f}% -> {iv_status}")
+    print(f"  - Unit conversions:        {rep0['unit_converted']} applied, "
+          f"{rep0['unit_mismatch']} unconvertible, "
+          f"{rep0['quote_value_mismatch']} value/quote mismatches")
+    print(f"  - Value conflicts:         {rep0['value_conflicts']} withheld "
+          f"(several verified values, no aggregation rule)")
     print(f"  - Unparseable replies:     {rep0['unparseable_replies']} -> {'GOOD (0)' if rep0['unparseable_replies']==0 else 'CONCERNING'}")
     print("=" * 70)
 
@@ -842,11 +1118,17 @@ def main() -> int:
             uid = rec["patient_uid"]
             per_outcome_details = {}
             for num in outcomes:
-                feats, present, reply = runs[0][uid][num]
+                feats, present, reply, detail = runs[0][uid][num]
                 per_outcome_details[num] = {
                     "outcome_name": TABLES[num].name,
                     "present": present,
                     "extracted_features": feats,
+                    # Every finding that cleared §2, in emission order, and every
+                    # feature withheld for disagreeing with itself. The review sheets
+                    # read these directly: re-deriving acceptance downstream is how a
+                    # hand-check sheet silently stops describing the run it came from.
+                    "accepted_findings": detail["accepted"],
+                    "conflicts": detail["conflicts"],
                     "grade_result": grade_results_detail[uid][num],
                     "raw_reply": reply,
                 }
@@ -861,26 +1143,34 @@ def main() -> int:
                 "outcomes": per_outcome_details,
             })
 
+        provenance = {
+            "tier": a.tier,
+            "weights": tier["hf"],
+            "served_as": model,
+            "backend": a.backend,
+            "quant": served_quant,
+            "model_digest": model_digest,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "notes_count": len(notes),
+            "cohort": a.cohort,
+            "stratified": a.stratify,
+            "holdout_frac": a.holdout_frac if a.stratify else None,
+            "outcomes": outcomes,
+            "repeat": a.repeat,
+            "concurrency": a.concurrency,
+            # True when consistency was measured under batching, which can flip a
+            # token at temperature 0 for reasons unrelated to the model.
+            "consistency_confounded_by_batching": a.concurrency > 1 and a.repeat > 1,
+        }
+        # Every artifact derived from this run carries this id. Without it a review
+        # sheet and a results file cannot be told apart from a review sheet and a
+        # DIFFERENT run's results file, and the reviewer's hours land on the wrong run.
+        provenance["run_id"] = "{}-{:08x}".format(
+            provenance["timestamp"].replace("-", "").replace(":", "").rstrip("Z"),
+            zlib.crc32(json.dumps(provenance, sort_keys=True).encode("utf-8")))
+
         out_data = {
-            "provenance": {
-                "tier": a.tier,
-                "weights": tier["hf"],
-                "served_as": model,
-                "backend": a.backend,
-                "quant": a.quant if a.backend == "hf" else None,
-                "model_digest": model_digest,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "notes_count": len(notes),
-                "cohort": a.cohort,
-                "stratified": a.stratify,
-                "holdout_frac": a.holdout_frac if a.stratify else None,
-                "outcomes": outcomes,
-                "repeat": a.repeat,
-                "concurrency": a.concurrency,
-                # True when consistency was measured under batching, which can flip a
-                # token at temperature 0 for reasons unrelated to the model.
-                "consistency_confounded_by_batching": a.concurrency > 1 and a.repeat > 1,
-            },
+            "provenance": provenance,
             "profiling": {
                 "total_wall_clock_sec": round(tallies[0].wall_clock_sec, 2),
                 "sec_per_note": round(tallies[0].wall_clock_sec / len(notes), 2),
@@ -904,6 +1194,15 @@ def main() -> int:
                 "tokenizer_artifacts": rep0["tokenizer_artifacts"],
                 "invalid_value_count": rep0["invalid_value"],
                 "invalid_value_pct": round(iv_pct, 1),
+                "unit_converted": rep0["unit_converted"],
+                "unit_ambiguous": rep0["unit_ambiguous"],
+                "unit_mismatch": rep0["unit_mismatch"],
+                "quote_value_mismatch": rep0["quote_value_mismatch"],
+                "value_conflicts": rep0["value_conflicts"],
+                # Quote verification is a grounding check: it asks whether the quoted
+                # words are in the note, never whether they support the value. There is
+                # no automated precision number here, and there should not appear to be.
+                "quote_verified_measures": "quote presence in the note, not value support",
                 "unparseable_replies": rep0["unparseable_replies"],
                 "run_to_run_consistency_pct": consistency_pct,
             },
