@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts
 from medgemma_extraction import (  # noqa: E402
     Tally, build_prompt, coerce, harness_status, is_scd_primary, normalize,
     outcome_seed, call_mock, reconcile, reduce_policy, scd_mentions,
-    select_notes, unit_guard, verify,
+    select_notes, unit_guard, verify, GGUF_FILE_TYPES,
 )
 
 NOTE = ("A 14-year-old with HbSS presented with chest pain. FiO2 was escalated to 60%. "
@@ -456,3 +456,19 @@ def test_an_absence_the_rules_produced_is_not_an_absence_the_model_produced():
 def test_every_other_status_passes_through_untouched():
     for st in ("graded", "grade_set", "cannot_grade", "not_applicable"):
         assert harness_status(st, True) == st and harness_status(st, False) == st
+
+
+# ------------------------------------------------------- provenance labelling
+
+def test_bf16_is_file_type_32_not_30():
+    """The 2026-09-01 A100 run served BF16 weights and recorded `file_type_32`,
+    because 30 was mapped to BF16 and 32 was missing. 30 is IQ4_XS."""
+    assert GGUF_FILE_TYPES[32] == "BF16"
+    assert GGUF_FILE_TYPES[30] == "IQ4_XS"
+    assert GGUF_FILE_TYPES[1] == "F16" and GGUF_FILE_TYPES[7] == "Q8_0"
+
+
+def test_an_unknown_file_type_is_recorded_raw_never_guessed():
+    """A quantisation the map does not know must not be labelled as one it does.
+    Recording the number keeps the provenance honest and debuggable."""
+    assert GGUF_FILE_TYPES.get(999) is None
