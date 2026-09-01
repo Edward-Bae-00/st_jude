@@ -61,6 +61,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from scogs.definitions import presence_brief
 from scogs.evaluate import grade
 from scogs.features import FEATURES
 from scogs.predicates import parse
@@ -82,18 +83,105 @@ TIERS = {
     },
 }
 
-
 # ------------------------------------------------------------------- prompting
+#
+# Every prompt and decoding change sits behind `--prompt-stage`, and stage "0"
+# reproduces the prompt this file shipped with, character for character. That is
+# not deference to the old prompt: an ablation only reads if one arm is the
+# untouched baseline, and the baseline has to come out of the same binary as the
+# other arms or it is measuring the binary too. The stages are ordered and
+# CUMULATIVE - each is the one before it plus one group of changes - so the arms
+# nest and a run is described by a single token.
+#
+#   0    the prompt as it was
+#   1    mechanical: constrained decoding, field order, rule grouping, framing
+#   2a   presence: the rubric's own definition, a quote behind `present`
+#   2b   an `evidence` field, generated first (chain-of-thought inside the JSON)
+#   3    precision: episode scope, negation, ladders, unit wording
+#
+# Stages 1 and 2 move counters this harness already prints. Stage 3 is expected
+# to move `accepted` DOWN - it exists to stop findings that should never have
+# been proposed - so it cannot be ranked on the automatic counters and is the
+# stage the hand-check sheets have to be filled against.
 
-def feature_brief(name: str, outcome: str) -> str:
+STAGES = ("0", "1", "2a", "2b", "3")
+
+
+@dataclass(frozen=True)
+class Stage:
+    """Which groups of changes are live. Build with `stage()`, never by hand."""
+    name: str = "0"
+    schema: bool = False        # 1  constrained decoding from a per-outcome JSON schema
+    structure: bool = False     # 1  field order, rule grouping, framing, delimiters
+    flat_penalty: bool = False  # 1  repeat_penalty 1.1 -> 1.0
+    retry: bool = False         # 1  retry on invalid CONTENT, not just transport
+    presence: bool = False      # 2a rubric definition + criteria, quoted `present`
+    death_both: bool = False    # 2a a death from another cause is also `false`
+    cot: bool = False           # 2b an `evidence` field, generated first
+    precision: bool = False     # 3  episode scope, negation, ladders, unit wording
+    note_first: bool = False    # independent of the ladder; see --note-first
+
+    @property
+    def rank(self) -> int:
+        return STAGES.index(self.name)
+
+
+def stage(name: str, note_first: bool = False) -> Stage:
+    if name not in STAGES:
+        raise ValueError(f"unknown prompt stage {name!r}; expected one of {', '.join(STAGES)}")
+    i = STAGES.index(name)
+    return Stage(name=name, note_first=note_first,
+                 schema=i >= 1, structure=i >= 1, flat_penalty=i >= 1, retry=i >= 1,
+                 presence=i >= 2, death_both=i >= 2,
+                 cot=i >= 3,
+                 precision=i >= 4)
+
+
+STAGE0 = Stage()
+
+
+# How an ordinal ladder actually appears in a case report. The schema's own
+# `values` are identifiers - `niv_bipap_cpap` - and the note says "started on
+# BiPAP overnight". Nothing in the prompt bridged that, on features the grade
+# turns on: outcome 48's grades 2, 3 and 4 separate on `resp_support` and
+# `transfusion_type` alone. These are prompting aids, not schema, which is why
+# they live here and not in `features.py`.
+ORD_CUES = {
+    "resp_support":
+        "room_air = no supplemental oxygen; low_flow_o2 = nasal cannula, face mask, "
+        "simple mask, up to about 6 L/min; high_flow = high-flow nasal cannula, HFNC, "
+        "Optiflow, Airvo, venturi mask at high flow; niv_bipap_cpap = BiPAP, CPAP, "
+        "non-invasive ventilation; invasive_ventilation = intubation, mechanical "
+        "ventilation, ventilated via tracheostomy.",
+    "transfusion_type":
+        "none = no red cell transfusion; simple = top-up, packed red cells, straight "
+        "transfusion; exchange = exchange transfusion, red cell exchange, "
+        "erythrocytapheresis, manual or automated exchange.",
+    "care_setting":
+        "home = managed without a facility visit; clinic_or_day_hospital = outpatient "
+        "clinic, day unit, infusion centre; ed_treat_release = seen in the emergency "
+        "department and discharged; inpatient = admitted to a ward; icu = intensive "
+        "care, critical care, HDU.",
+}
+
+
+def feature_brief(name: str, outcome: str, st: Stage = STAGE0) -> str:
     spec = FEATURES[name]
     bits = [f'"{name}" ({spec["type"]}']
     if spec["values"]: bits.append(f', one of: {", ".join(spec["values"])}')
-    if spec["unit"]:   bits.append(f', in {spec["unit"]}')
+    if spec["unit"]:
+        # Stage 0 renders the schema's unit as though it were an instruction
+        # ("in mg/dL") three lines above a rule telling the model not to convert.
+        # The unit is the pipeline's target, not the model's job: `unit_guard`
+        # reaches it from the quote.
+        bits.append(f', in {spec["unit"]}' if not st.precision
+                    else f'; the pipeline converts to {spec["unit"]}')
     bits.append(")")
     line = "".join(bits) + " - " + spec["definition"]
     clarifier = spec["per_outcome"].get(outcome)
     if clarifier: line += f" For this outcome specifically: {clarifier}"
+    if st.precision and name in ORD_CUES:
+        line += f" In notes this reads as: {ORD_CUES[name]}"
     return line
 
 
@@ -121,20 +209,117 @@ def expand_derived(names: set[str]) -> set[str]:
     return out
 
 
-def build_prompt(note: str, outcome: str) -> str:
-    table = TABLES[outcome]
-    needed = {n for _, pred in table.all_rows() for n in parse(pred).names()}
-    if table.on: needed.add(table.on)
-    needed = sorted(expand_derived(needed))
-    lines = "\n".join(f"  - {feature_brief(n, outcome)}" for n in needed)
+def grade_weight(outcome: str) -> dict[str, tuple[int, int]]:
+    """-> feature -> (highest grade it can trigger, how many rows it appears in).
 
-    # Only for tables that actually grade on it. Every outcome with a `death_attributed`
-    # row is capped at grade_set while that value is unknown - the engine cannot rule out
-    # the top grade - so an omission that looks neutral silently prevents any definite
-    # grade. The 2026-09-01 A100 run extracted it zero times across 80 pairs, and every
-    # graded pair it produced was Fever, the one outcome of the four with no death row.
-    # This does not weaken the section 2 contract: "discharged home on day 5" is a
-    # verbatim quote, and it supports `false`.
+    Stage 0 lists features alphabetically. For outcome 48 that opens with
+    `acs_other_support` - one row, negated, grade 1 - and pushes the three
+    features grades 2, 3 and 4 actually separate on into the middle of the list.
+    A derived feature hands its weight to the features it expands into, because
+    those are the names the model is asked for.
+    """
+    table = TABLES[outcome]
+    seen: dict[str, list[int]] = {}
+    for g, pred in table.all_rows():
+        for n in parse(pred).names():
+            for leaf in expand_derived({n}):
+                seen.setdefault(leaf, []).append(g)
+    if table.on:
+        top = max(table.grades(), default=0)
+        for leaf in expand_derived({table.on}):
+            seen.setdefault(leaf, []).append(top)
+    return {n: (max(gs), len(gs)) for n, gs in seen.items()}
+
+
+def order_features(names: list[str], outcome: str, st: Stage = STAGE0) -> list[str]:
+    """Highest grade first, then most rows, then name. Alphabetical at stage 0."""
+    if not st.structure:
+        return sorted(names)
+    w = grade_weight(outcome)
+    return sorted(names, key=lambda n: (-w.get(n, (0, 0))[0], -w.get(n, (0, 0))[1], n))
+
+
+# ------------------------------------------------------- constrained decoding
+
+def value_schema(name: str) -> dict:
+    spec = FEATURES[name]
+    if spec["type"] == "bool": return {"type": "boolean"}
+    if spec["type"] == "num":  return {"type": "number"}
+    return {"enum": list(spec["values"] or [])}
+
+
+def reply_schema(needed: list[str], st: Stage) -> dict:
+    """The JSON Schema handed to the decoder.
+
+    Stage 0 sends the bare string "json", which buys a syntactically valid object
+    and nothing else. `unknown_feature`, `value_bad` and the null-quote
+    placeholders were all still reachable, and all three were being COUNTED as
+    model failures when the decoder could have made them unreachable. Here the
+    feature name is an enum of what this outcome grades on, each value is typed
+    from the schema, and a quote is a non-empty string.
+    """
+    finding = [{
+        "type": "object",
+        "properties": {"feature": {"const": n},
+                       "value": value_schema(n),
+                       "quote": {"type": "string", "minLength": 1}},
+        "required": ["feature", "value", "quote"],
+        "additionalProperties": False,
+    } for n in needed]
+
+    props: dict[str, dict] = {}
+    required: list[str] = []
+    if st.cot:
+        props["evidence"] = {"type": "string"}
+        required.append("evidence")
+    # `findings` ahead of `present`, and the schema has to agree with the prompt:
+    # for a decoder that honours property order this IS the generation order.
+    props["findings"] = {"type": "array", "items": {"anyOf": finding}}
+    props["present"] = {"type": "boolean"}
+    required += ["findings", "present"]
+    if st.presence:
+        # Deliberately NOT required. A note that does not evidence an outcome
+        # frequently contains no sentence saying so, and a schema that demands a
+        # quote there buys a fabricated one instead of an honest omission. The
+        # prose asks for it when `present` is true; `present_unquoted` counts
+        # what comes back without one.
+        props["present_quote"] = {"type": "string"}
+    return {"type": "object", "properties": props, "required": required,
+            "additionalProperties": False}
+
+
+def reply_is_usable(reply: str) -> bool:
+    """Is this reply worth keeping, or should the call be retried?
+
+    Stage 0 retries only on a transport exception, so an HTTP 200 carrying a
+    findings list of null placeholders was accepted first time, every time. This
+    is the content-level gate: parseable, and no finding that the verifier would
+    throw away before it ever reached the note.
+    """
+    try:
+        data = json.loads(reply)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict) or "findings" not in data:
+        return False
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return False
+    for f in findings:
+        if not isinstance(f, dict): return False
+        if not f.get("feature") or not f.get("quote"): return False
+        if f.get("value") is None: return False
+    return True
+
+
+# ------------------------------------------------------------ prompt assembly
+
+def _indent(text: str, pad: str = "    ") -> str:
+    return "\n".join(pad + ln if ln.strip() else ln for ln in text.split("\n"))
+
+
+def _prompt_v0(note: str, outcome: str, table, needed: list[str], lines: str) -> str:
+    """The stage 0 prompt, unchanged. Do not edit - it is the baseline arm."""
     survival = ""
     if "death_attributed" in needed:
         survival = (
@@ -171,6 +356,150 @@ Reply with JSON only, no prose:
 NOTE:
 \"\"\"{note}\"\"\""""
 
+
+def _rules_v1(needed: list[str], st: Stage) -> str:
+    """The rules, grouped. Stage 0 is one flat list of seven bullets that mixes a
+    hard contract (the quote) with a preference (report once) and a definition
+    (`present`), giving the reader nothing to tell them apart."""
+    g = ["## How to report", (
+        "Grounding - a contract, not a preference:\n"
+        "- Every finding MUST carry a quote copied EXACTLY from the note, character for "
+        "character.\n"
+        "- A finding whose quote is not found in the note is discarded, not down-weighted. "
+        "Reporting\n  nothing costs you less than reporting something you cannot quote.\n"
+        "- Never emit a finding whose value or quote is null. Leave it out of the list "
+        "entirely.")]
+
+    if st.precision:
+        g.append(
+            "Quote the SHORTEST continuous run of the note's own words that proves the value, "
+            "usually\n3-12 words. Never join text from different sentences, never write '...', "
+            "never fix a typo,\nnever paraphrase. Copy one continuous span or report nothing.")
+
+    g.append(
+        "What to report:\n"
+        "- Report a finding ONLY if the note explicitly supports it. Omit anything the note "
+        "does not\n  address. Omitting is correct and expected; guessing is not. An empty "
+        "findings list is a\n  valid and often correct answer.\n"
+        '- Report each feature at most ONCE. Where its definition names an extreme ("highest",\n'
+        '  "maximum", "most intensive"), report that one value, not every occurrence.')
+
+    if st.precision:
+        g.append(
+            "What does NOT support a finding:\n"
+            '- Negation. "remained afebrile", "did not require intubation", "no transfusion was\n'
+            '  given" are evidence the finding is FALSE or absent - never evidence it happened.\n'
+            '- Things considered but not done. "exchange transfusion was considered", "planned\n'
+            '  for ICU admission", "would have required ventilation" are not the event.\n'
+            "- Anything belonging to another person, or to a different admission.")
+
+    if "death_attributed" in needed:
+        d = ("Death:\n"
+             "- Absence of an event can be explicitly supported. If the note shows the patient "
+             "survived\n  this episode - discharge, follow-up, recovery, ongoing care - report "
+             '"death_attributed": false\n  and quote that text. Leaving it unknown is not '
+             "neutral: no outcome can be graded while\n  it is unknown whether the patient died.")
+        if st.death_both:
+            d += ('\n- If the patient died but the note attributes the death to a different '
+                  'cause, that is\n  ALSO "death_attributed": false - quote the cause the note '
+                  "gives. Only a death this note\n  ties to THIS outcome is true.")
+        g.append(d)
+
+    if any(FEATURES[n]["type"] == "num" for n in needed):
+        u = ("Numbers:\n"
+             "- Copy the number as the note states it, in the note's OWN units. Do not convert "
+             "- the\n  pipeline does that.")
+        if st.precision:
+            u += ("\n- The quote for a number MUST contain both the number and its unit. Without "
+                  "the unit the\n  pipeline cannot tell which one you meant, and the finding is "
+                  "discarded.")
+        g.append(u)
+
+    return "\n\n".join(g)
+
+
+def _output_v1(st: Stage) -> str:
+    fields = []
+    if st.cot:
+        fields.append(
+            '  "evidence": "<2-4 sentences. What the note says that bears on this outcome, and\n'
+            '               which of the findings above it does and does not support. Reason\n'
+            '               here, so the fields below are read off rather than guessed at.>",')
+    fields.append('  "findings": [{"feature": "<name>", "value": <value>, '
+                  '"quote": "<exact text from the note>"}],')
+    fields.append('  "present": true|false' + ("," if st.presence else ""))
+    if st.presence:
+        fields.append('  "present_quote": "<exact text from the note evidencing this outcome, '
+                      'when present is true>"')
+    empty = ('{"evidence": "...", "findings": [], "present": false}' if st.cot
+             else '{"findings": [], "present": false}')
+    joined = "\n".join(fields)
+    # Field order is the point. Stage 0 puts `present` first, so the decoder
+    # commits to the field that discards every other result before it has read
+    # out a single finding.
+    return ("## Output\n"
+            "Reply with JSON only, no prose. Fill the fields in the order shown - the findings "
+            "first,\nthen the presence call they support.\n\n"
+            f"{{\n{joined}\n}}\n\n"
+            f"When the note supports nothing, that is a complete answer:\n{empty}")
+
+
+def _prompt_v1(note: str, outcome: str, table, needed: list[str], lines: str, st: Stage) -> str:
+    blocks = [
+        "You are reading a clinical note and reporting what it says about specific findings.\n"
+        "A separate rule engine turns what you report into a severity grade, so your job is\n"
+        "observation only.",
+        f"Health outcome under consideration: {outcome} - {table.name}",
+    ]
+
+    if st.precision:
+        blocks.append(
+            "## The episode\n"
+            "Case reports often span years and several admissions, and often describe more than\n"
+            "one person - a donor, a relative, a comparison case. Report the ONE episode of this\n"
+            "outcome the note is about, for the patient the report is about. Values from an\n"
+            "earlier or later admission, from the patient's baseline or steady state, or from\n"
+            "anyone else are not findings for this episode.")
+
+    if st.presence:
+        head = ('## What "present" means\n'
+                '"present" is whether the note evidences this health outcome at all. The tables\n'
+                "consult it first: when it is false, nothing else you report is used.")
+        brief = presence_brief(outcome)
+        if brief:
+            head += "\n\nThe rubric defines this outcome as:\n\n" + _indent(brief)
+        blocks.append(head)
+
+    blocks += ["## Findings to extract\nReport only these, and only what the note supports:\n" + lines,
+               _rules_v1(needed, st),
+               _output_v1(st)]
+
+    body = "\n\n".join(blocks)
+    doc = f"<note>\n{note}\n</note>"
+    return f"{doc}\n\n{body}" if st.note_first else f"{body}\n\n{doc}"
+
+
+def prompt_features(outcome: str, st: Stage = STAGE0) -> list[str]:
+    """The features this outcome's prompt asks for, in the order it asks for them.
+
+    The schema's `feature` enum is built from this, so the two cannot drift: a
+    name the prompt asks for and the grammar forbids is an unanswerable question,
+    and one the grammar allows and the prompt never mentions is `unknown_feature`
+    coming back through the front door.
+    """
+    table = TABLES[outcome]
+    needed = {n for _, pred in table.all_rows() for n in parse(pred).names()}
+    if table.on: needed.add(table.on)
+    return order_features(sorted(expand_derived(needed)), outcome, st)
+
+
+def build_prompt(note: str, outcome: str, st: Stage = STAGE0) -> str:
+    table = TABLES[outcome]
+    needed = prompt_features(outcome, st)
+    lines = "\n".join(f"  - {feature_brief(n, outcome, st)}" for n in needed)
+    if not st.structure:
+        return _prompt_v0(note, outcome, table, needed, lines)
+    return _prompt_v1(note, outcome, table, needed, lines, st)
 
 # -------------------------------------------------------------------- backends
 
@@ -210,12 +539,22 @@ def get_model_digest(model: str, host: str) -> str:
 
 
 def call_ollama(prompt: str, model: str, host: str, stats: dict | None = None,
-                timeout: int = 300, **kwargs) -> str:
+                timeout: int = 300, fmt=None, seed: int = 0, temperature: float = 0.0,
+                num_predict: int = 1024, repeat_penalty: float = 1.1, **kwargs) -> str:
     # keep_alive -1 pins the model in VRAM. Without it Ollama unloads after 5 idle
     # minutes and the next call silently pays a full reload - 50+ GB at the F16 tier.
+    #
+    # `repeat_penalty` defaults to the stage 0 value of 1.1 and is dropped to 1.0
+    # from stage 1. A repetition penalty on a task whose output must contain text
+    # copied verbatim out of the note is pushing against the job: quotes reuse the
+    # note's tokens, feature names recur, and JSON punctuation recurs hardest of
+    # all. At temperature 0 under a grammar it buys nothing and can walk the
+    # decoder off an exact span, which lands as `quote_unfound`.
     body = json.dumps({"model": model, "prompt": prompt, "stream": False,
-                       "format": "json", "keep_alive": -1,
-                       "options": {"temperature": 0, "seed": 0, "num_predict": 1024, "repeat_penalty": 1.1}}).encode("utf-8")
+                       "format": fmt if fmt is not None else "json", "keep_alive": -1,
+                       "options": {"temperature": temperature, "seed": seed,
+                                   "num_predict": num_predict,
+                                   "repeat_penalty": repeat_penalty}}).encode("utf-8")
     req = urllib.request.Request(f"{host}/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -275,12 +614,20 @@ def get_hf_pipeline(model_name: str, quant: str = "none"):
 
 
 def call_hf(prompt: str, model: str, host: str, stats: dict | None = None,
-            quant: str = "none", **kwargs) -> str:
+            quant: str = "none", num_predict: int = 1024, repeat_penalty: float = 1.1,
+            seed: int = 0, temperature: float = 0.0, **kwargs) -> str:
     pipe = get_hf_pipeline(model, quant)
     t0 = time.time()
     messages = [{"role": "user", "content": prompt}]
     prompt_formatted = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    out = pipe(prompt_formatted, max_new_tokens=1024, do_sample=False, repetition_penalty=1.1)
+    # No grammar here: transformers has no schema-constrained decoding in this
+    # path, so the reply is fenced out below and the content gate does the rest.
+    sample = temperature > 0
+    gen = {"max_new_tokens": num_predict, "do_sample": sample,
+           "repetition_penalty": repeat_penalty}
+    if sample:
+        gen["temperature"] = temperature
+    out = pipe(prompt_formatted, **gen)
     gen_text = out[0]["generated_text"][len(prompt_formatted):].strip()
     dur = time.time() - t0
     if stats is not None:
@@ -297,15 +644,23 @@ def call_hf(prompt: str, model: str, host: str, stats: dict | None = None,
 
 
 def call_openai_compatible(prompt: str, model: str, host: str, stats: dict | None = None,
-                           timeout: int = 300, **kwargs) -> str:
+                           timeout: int = 300, fmt=None, seed: int = 0,
+                           temperature: float = 0.0, num_predict: int = 1024,
+                           **kwargs) -> str:
     url = f"{host.rstrip('/')}/v1/chat/completions"
+    # A schema goes as `json_schema`; without one this falls back to `json_object`,
+    # which only guarantees the reply parses.
+    response_format = ({"type": "json_schema",
+                        "json_schema": {"name": "scogs_findings", "strict": True,
+                                        "schema": fmt}}
+                       if isinstance(fmt, dict) else {"type": "json_object"})
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "seed": 0,
-        "max_tokens": 1024,
-        "response_format": {"type": "json_object"}
+        "temperature": temperature,
+        "seed": seed,
+        "max_tokens": num_predict,
+        "response_format": response_format,
     }).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -332,7 +687,9 @@ def call_mock(prompt: str, model: str, host: str, stats: dict | None = None, **k
     is exercised too - otherwise the absence audit has nothing to run on and a
     broken absent branch ships unnoticed. It does not touch the quote tally,
     which counts proposals regardless of presence."""
-    m = re.search(r'NOTE:\n"""(.*)"""', prompt, re.S)
+    # Stage 0 fences the note with triple quotes, stage 1+ with <note> tags.
+    m = (re.search(r"<note>\n(.*)\n</note>", prompt, re.S)
+         or re.search(r'NOTE:\n"""(.*)"""', prompt, re.S))
     note = m.group(1) if m else ""
     outcome = (re.search(r"Health outcome under consideration: (\S+)", prompt) or [None, "0"])[1]
     present = zlib.crc32(f"{outcome}:{note[:120]}".encode()) % 3 != 0
@@ -549,6 +906,15 @@ class Tally:
     unit_mismatch: int = 0         # quote's unit cannot reach the declared one
     quote_value_mismatch: int = 0  # number is not the one its own quote carries
     value_conflicts: int = 0       # several verified values, no aggregation rule
+    # `present` gates every other result - `grade()` returns absent whenever it is
+    # false - and stage 0 is the only field in the reply carrying no quote at all.
+    # From stage 2a it is asked for and these count what comes back.
+    present_true: int = 0          # pairs the model called present
+    present_quoted: int = 0        # ... of those, with a quote that is in the note
+    present_quote_unfound: int = 0 # ... with a quote that is not
+    present_unquoted: int = 0      # ... with no quote offered
+    content_retries: int = 0       # calls redone because the reply was unusable
+    unusable_replies: int = 0      # ... and still unusable when the tries ran out
     per_feature: Counter = field(default_factory=Counter)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -579,6 +945,13 @@ class Tally:
             "unit_mismatch": self.unit_mismatch,
             "quote_value_mismatch": self.quote_value_mismatch,
             "value_conflicts": self.value_conflicts,
+            "present_true": self.present_true,
+            "present_quoted": self.present_quoted,
+            "present_quote_unfound": self.present_quote_unfound,
+            "present_unquoted": self.present_unquoted,
+            "present_quoted_pct": round(100 * self.present_quoted / (self.present_true or 1), 1),
+            "content_retries": self.content_retries,
+            "unusable_replies": self.unusable_replies,
             "missing_quote": self.quote_missing,
             "invalid_value": self.value_bad,
             "unknown_feature": self.unknown_feature,
@@ -619,7 +992,7 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None, dict
     perfectly behind fio2_pct=21. That judgement is human, and it is what the
     hand-check sheet's `supports_value` column exists to record.
     """
-    empty = {"accepted": [], "conflicts": {}}
+    empty = {"accepted": [], "conflicts": {}, "present_quote": None, "evidence": None}
     try:
         data = json.loads(reply)
     except json.JSONDecodeError:
@@ -668,6 +1041,17 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None, dict
         tally.accepted += 1
         tally.per_feature[name] += 1
 
+    present = data.get("present")
+    if present is True:
+        tally.present_true += 1
+        pq = data.get("present_quote")
+        if not pq or not isinstance(pq, str):
+            tally.present_unquoted += 1
+        elif normalize(pq) not in hay:
+            tally.present_quote_unfound += 1
+        else:
+            tally.present_quoted += 1
+
     out, conflicts = {}, {}
     for name, vals in cand.items():
         picked, clash = reconcile(name, vals)
@@ -676,7 +1060,9 @@ def verify(reply: str, note: str, tally: Tally) -> tuple[dict, bool | None, dict
             tally.value_conflicts += 1
             continue
         out[name] = picked
-    return out, data.get("present"), {"accepted": accepted, "conflicts": conflicts}
+    return out, present, {"accepted": accepted, "conflicts": conflicts,
+                          "present_quote": data.get("present_quote"),
+                          "evidence": data.get("evidence")}
 
 
 # ------------------------------------------------------------------------ main
@@ -855,8 +1241,32 @@ def select_notes(pool: list[dict], n: int, outcomes: list[str], *, seed: int = 2
     return picked, selection
 
 
+# How many times one (note, outcome) call may be redone because the CONTENT came
+# back unusable. Stage 0 retries only on a transport exception, so a 200 carrying
+# a list of null placeholders was taken first time; the placeholders were then
+# counted as a model failure the harness never gave the model a chance to fix.
+MAX_CONTENT_TRIES = 3
+
+
+def generate(backend, prompt, model, host, stats, st: Stage, fmt, **kw) -> tuple[str, int]:
+    """-> (reply, retries). One backend call, redone while the reply is unusable.
+
+    The seed moves on every retry. Retrying at temperature 0 with a fixed seed
+    re-runs the same arithmetic and returns the same bytes, so a retry that does
+    not change the seed is a wasted call by construction.
+    """
+    tries = MAX_CONTENT_TRIES if st.retry else 1
+    reply = ""
+    for attempt in range(tries):
+        reply = BACKENDS[backend](prompt, model, host, stats=stats, fmt=fmt,
+                                  seed=attempt, **kw)
+        if not st.retry or reply_is_usable(reply):
+            return reply, attempt
+    return reply, tries - 1
+
+
 def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300,
-        concurrency=1):
+        concurrency=1, st: Stage = STAGE0, num_predict: int | None = None):
     """Model calls first (optionally in parallel), then verification - always serial.
 
     Verification stays on the main thread in the original note-major order, so the
@@ -873,14 +1283,23 @@ def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300,
     print_lock = threading.Lock()
     t0 = time.time()
 
+    # An `evidence` field is prose the model writes before the findings, so the
+    # budget that fitted findings alone truncates the reply mid-object and the
+    # whole pair is lost as bad JSON.
+    budget = num_predict if num_predict else (2048 if st.cot else 1024)
+    retries = [0] * total
+
     def call(i):
         nonlocal done
         rec, num = tasks[i]
         local = {"prompt_eval_count": 0, "eval_count": 0,
                  "eval_duration_sec": 0.0, "total_duration_sec": 0.0}
-        reply = BACKENDS[backend](build_prompt(rec["patient"], num), model, host,
-                                  stats=local, quant=quant, timeout=timeout)
-        replies[i], stats_parts[i] = reply, local
+        prompt = build_prompt(rec["patient"], num, st)
+        fmt = reply_schema(prompt_features(num, st), st) if st.schema else None
+        reply, n_retry = generate(backend, prompt, model, host, local, st, fmt,
+                                  quant=quant, timeout=timeout, num_predict=budget,
+                                  repeat_penalty=1.0 if st.flat_penalty else 1.1)
+        replies[i], stats_parts[i], retries[i] = reply, local, n_retry
         with print_lock:
             done += 1
             print(f"  [{done}/{total}] UID {rec['patient_uid']} outcome {num} "
@@ -896,6 +1315,9 @@ def run(notes, outcomes, backend, model, host, tally, quant="none", timeout=300,
     results = {}
     for i, (rec, num) in enumerate(tasks):
         reply = replies[i] or ""
+        tally.content_retries += retries[i]
+        if st.retry and not reply_is_usable(reply):
+            tally.unusable_replies += 1
         feats, present, detail = verify(reply, rec["patient"], tally)
         results.setdefault(rec["patient_uid"], {})[num] = (feats, present, reply, detail)
 
@@ -937,8 +1359,24 @@ def main() -> int:
                     help="in-flight backend requests (default 1 = sequential). Needs a "
                          "server that batches, e.g. OLLAMA_NUM_PARALLEL>=N. See the "
                          "warning printed when this is combined with --repeat")
+    ap.add_argument("--prompt-stage", choices=list(STAGES), default="0",
+                    help="cumulative ablation rung (default 0 = the prompt unchanged). "
+                         "1 adds constrained decoding, field order, grouped rules and a "
+                         "flat repeat penalty; 2a adds the rubric's presence definition "
+                         "and a quoted `present`; 2b adds an `evidence` field; 3 adds "
+                         "episode scope, negation, ordinal cues and the unit wording. "
+                         "Stage 3 is expected to LOWER `accepted` and can only be judged "
+                         "from the hand-check sheets")
+    ap.add_argument("--note-first", action="store_true",
+                    help="put the note above the instructions (stage >= 1). Off by "
+                         "default: at a median 469 words the gain is small and it costs "
+                         "the shared prefix across an outcome's four calls")
+    ap.add_argument("--num-predict", type=int, default=None,
+                    help="completion token budget (default 1024, or 2048 once --prompt-stage "
+                         "adds the evidence field)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    st = stage(a.prompt_stage, note_first=a.note_first)
 
     if a.concurrency > 1 and a.backend == "hf":
         print("!! --backend hf holds one lazily-initialised global pipeline and is not "
@@ -1000,7 +1438,8 @@ def main() -> int:
         t_start = time.time()
         try:
             runs.append(run(notes, outcomes, a.backend, model, a.host, t,
-                            quant=a.quant, timeout=a.timeout, concurrency=a.concurrency))
+                            quant=a.quant, timeout=a.timeout, concurrency=a.concurrency,
+                            st=st, num_predict=a.num_predict))
         except (urllib.error.URLError, TimeoutError) as e:
             raise SystemExit(f"backend unreachable at {a.host}: {e}\n"
                              f"start it, or use --backend mock to exercise the harness")
@@ -1025,6 +1464,13 @@ def main() -> int:
         if rep['quote_value_mismatch']:
             print(f"  Number not in quote:  {rep['quote_value_mismatch']} rejected - the "
                   f"value is neither the number its quote carries nor its conversion")
+        if rep['present_true']:
+            print(f"    present=true:       {rep['present_true']:4d}  of which quoted "
+                  f"{rep['present_quoted']} ({rep['present_quoted_pct']:.1f}%), "
+                  f"unfound {rep['present_quote_unfound']}, unquoted {rep['present_unquoted']}")
+        if rep['content_retries'] or rep['unusable_replies']:
+            print(f"    content retries:    {rep['content_retries']:4d}  "
+                  f"still unusable after retrying: {rep['unusable_replies']}")
         if rep['value_conflicts']:
             print(f"  !! VALUE CONFLICTS:   {rep['value_conflicts']} feature(s) had several "
                   f"verified values and no aggregation rule.")
@@ -1181,6 +1627,12 @@ def main() -> int:
             "outcomes": outcomes,
             "repeat": a.repeat,
             "concurrency": a.concurrency,
+            # The rung, and what it turned on. A results file that does not say which
+            # prompt produced it cannot be placed on the ladder, and the ladder is the
+            # only thing that says which change bought which number.
+            "prompt_stage": st.name,
+            "prompt_stage_flags": {k: v for k, v in vars(st).items()
+                                   if k != "name" and v},
             # True when consistency was measured under batching, which can flip a
             # token at temperature 0 for reasons unrelated to the model.
             "consistency_confounded_by_batching": a.concurrency > 1 and a.repeat > 1,
@@ -1222,6 +1674,17 @@ def main() -> int:
                 "unit_mismatch": rep0["unit_mismatch"],
                 "quote_value_mismatch": rep0["quote_value_mismatch"],
                 "value_conflicts": rep0["value_conflicts"],
+                "accepted": rep0["accepted"],
+                "unknown_feature": rep0["unknown_feature"],
+                # `present` gates every other result, so its grounding belongs beside the
+                # findings' grounding rather than only in the per-run tally.
+                "present_true": rep0["present_true"],
+                "present_quoted": rep0["present_quoted"],
+                "present_quote_unfound": rep0["present_quote_unfound"],
+                "present_unquoted": rep0["present_unquoted"],
+                "present_quoted_pct": rep0["present_quoted_pct"],
+                "content_retries": rep0["content_retries"],
+                "unusable_replies": rep0["unusable_replies"],
                 # Quote verification is a grounding check: it asks whether the quoted
                 # words are in the note, never whether they support the value. There is
                 # no automated precision number here, and there should not appear to be.

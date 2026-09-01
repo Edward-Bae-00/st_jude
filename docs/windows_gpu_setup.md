@@ -4,13 +4,13 @@ This document details how to set up and run the `full` reporting tier (**MedGemm
 
 ---
 
-## Hardware Requirements
+## Hardware Requirements & Matrix
 
-- **GPU:** NVIDIA GPU with CUDA support (RTX 3090, RTX 4090, RTX 5000/6000, A5000, A6000, or A100/H100).
-- **VRAM Guide:**
-  - **Full precision / bfloat16:** $\ge 56\text{ GB}$ VRAM (dual 3090/4090, A6000, or A100).
-  - **8-bit Quantized (`bitsandbytes`):** $\ge 30\text{ GB}$ VRAM.
-  - **4-bit Quantized (`bitsandbytes` or GGUF Q4):** $\ge 18\text{ GB}$ VRAM (runs on a single 24GB RTX 3090 / RTX 4090).
+| Hardware Setup | Quantization / Mode | VRAM & System RAM Footprint | Notes |
+| :--- | :--- | :--- | :--- |
+| **RTX 4080 (16 GB VRAM) + 32 GB DDR5 RAM** | **4-bit Quantized** (Ollama GGUF Q4 or `bitsandbytes` 4-bit) | Model weights consume ~14.2 GB. Ollama/HF loads ~95–100% of layers directly in the 16 GB GDDR6X VRAM; the **32 GB DDR5 RAM** provides safety buffer for KV cache & Windows DWM overhead without OOM. | **Recommended target setup.** Fast tokens/sec (~15–25 t/s). |
+| **RTX 3090 / RTX 4090 (24 GB VRAM)** | **4-bit or 8-bit Quantized** | Fits 100% inside 24 GB VRAM with substantial headroom. | Runs with zero CPU offload needed. |
+| **Multi-GPU / Server ($\ge 56\text{ GB}$ VRAM: 2x 3090/4090, A6000, A100)** | **Full precision / bfloat16** | ~54 GB VRAM required. | Full unquantized inference. |
 
 ---
 
