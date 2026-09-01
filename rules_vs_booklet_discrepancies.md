@@ -62,6 +62,24 @@ These were left as-is in `rules.md`. Each is a place where the booklet is wrong 
 
 ---
 
+## Decision-table deviations from `rules.md` — `scripts/scogs/tables.py`
+
+A different axis from the rest of this file: everything above compares `rules.md` against
+the booklet. This section records where the executable decision tables deviate from
+`rules.md`, so a grade that does not follow from the rubric as written can always be
+traced to a decision rather than a bug.
+
+| Outcome | `rules.md` text | `tables.py` rule | Why |
+| :--- | :--- | :--- | :--- |
+| **36 Fever** | Grade 1: "Temperature 38.0 – 38.4 °C **(100.4 - 101.2 degrees Fahrenheit)**"; Grade 2: "Temperature **> 38.5** Celsius **(101.3 degrees Fahrenheit)**" (l. 1572–1573) | Grade 1: `38.0 <= temperature < 38.5`<br>Grade 2: `temperature >= 38.5` | **Clinically significant.** As written the Celsius bands are not contiguous: `(38.4, 38.5]` matches no grade, so 38.5 °C — a fever — grades as `absent`. **The rubric's own Fahrenheit annotations resolve it.** 100.4 °F = 38.0000 °C, 101.2 °F = **38.4444** °C, 101.3 °F = **38.5000** °C. The Fahrenheit bands *are* contiguous, and the Celsius text is a one-decimal rounding of 38.4444 — so the intended bands are `[38.0, 38.5)` and `[38.5, ∞)`. Note the literal reading is worse than a lone gap at 38.5: a note reporting **101.2 °F, the rubric's own Grade 1 endpoint**, converts to 38.4444 and grades as `absent`. Closed 2026-08-31. Surfaced by two pairs in the 2026-09-01 A100 run that landed on exactly 38.5 and were reported as `refuted` — the model read the fever correctly and the tables overruled it. **Flagging so the booklet can be corrected at source: the Celsius bands should read 38.0–38.4 and ≥ 38.5.** |
+
+**Gaps deliberately left open.** Outcome 10 (Pain and Hurt score of exactly 60) has the
+same shape — Grade 3 and Grade 2 bands that do not meet — but no equivalent evidence of
+intent, so it stays open and returns cannot-determine rather than being rounded into a
+band. See the `RUBRIC GAP` note on that table.
+
+---
+
 ## Intentional formatting differences (not discrepancies)
 
 `rules.md` is a restructured reference manual, not a transcription. The following are by design and were not changed:

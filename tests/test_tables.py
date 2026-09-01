@@ -338,10 +338,30 @@ def test_40_wound_of_exactly_8_cm2_falls_in_the_documented_gap():
 
 # --------------------------------------------------------- rubric gaps, recorded
 
-def test_36_temperature_385_falls_in_the_documented_gap():
+def test_36_temperature_385_is_a_fever_the_rubric_gap_is_closed():
+    """The rubric leaves (38.4, 38.5] matching no grade, so 38.5 degC - a fever -
+    graded as absent. Closed to '>= 38.5': the rubric annotates that bound as
+    "(101.3 degrees Fahrenheit)", which is exactly 38.5 C, and a strict bound is not
+    annotated with the value it excludes. Two pairs in the 2026-09-01 A100 run landed
+    on exactly 38.5 and were reported as refuted, which is how this surfaced."""
     assert grade("36", dict(temperature=38.4)).grade == 1
+    assert grade("36", dict(temperature=38.5)).grade == 2
     assert grade("36", dict(temperature=38.6)).grade == 2
-    assert grade("36", dict(temperature=38.5)).status == ABSENT
+    assert grade("36", dict(temperature=38.45)).grade == 1   # nothing falls through now
+    assert grade("36", dict(temperature=37.9)).status == ABSENT
+
+
+def test_36_the_rubrics_own_fahrenheit_bands_grade_correctly():
+    """The Celsius text is a rounding of the Fahrenheit bands, which are contiguous:
+    Grade 1 "(100.4 - 101.2 F)" is 38.0000-38.4444 C, Grade 2 "(101.3 F)" is exactly
+    38.5000 C. Under the literal "<= 38.4" a note reporting 101.2 F - the rubric's own
+    Grade 1 endpoint - converts to 38.4444 and graded as absent. The extraction harness
+    converts Fahrenheit quotes, so this is reachable, not theoretical."""
+    f_to_c = lambda f: round((f - 32.0) * 5.0 / 9.0, 4)
+    assert grade("36", dict(temperature=f_to_c(100.4))).grade == 1   # 38.0
+    assert grade("36", dict(temperature=f_to_c(101.2))).grade == 1   # 38.4444
+    assert grade("36", dict(temperature=f_to_c(101.3))).grade == 2   # 38.5
+    assert grade("36", dict(temperature=f_to_c(100.3))).status == ABSENT
 
 
 def test_10_pain_hurt_score_60_falls_in_the_documented_gap():

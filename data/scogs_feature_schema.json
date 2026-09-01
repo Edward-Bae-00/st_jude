@@ -3118,15 +3118,15 @@
    "rules": [
     {
      "grade": 2,
-     "when": "temperature > 38.5"
+     "when": "temperature >= 38.5"
     },
     {
      "grade": 1,
-     "when": "38.0 <= temperature <= 38.4"
+     "when": "38.0 <= temperature < 38.5"
     }
    ],
    "notes": [
-    "RUBRIC GAP: a temperature of exactly 38.5 degC matches no grade - Grade 1 is 38.0-38.4 and Grade 2 is '> 38.5'. Left as a gap; 38.5 returns cannot-determine rather than being silently rounded into either band."
+    "RUBRIC GAP CLOSED (2026-08-31): the rubric's Celsius text - Grade 1 '38.0-38.4', Grade 2 '> 38.5' - leaves (38.4, 38.5] matching no grade, so a temperature of exactly 38.5 degC graded as absent. The rubric's own Fahrenheit annotations resolve it: Grade 1 is '(100.4 - 101.2 degrees Fahrenheit)' = 38.0000-38.4444 degC, and Grade 2 is '(101.3 degrees Fahrenheit)' = exactly 38.5000 degC. The bands are contiguous in Fahrenheit and the Celsius text is a one-decimal rounding of 38.4444. So the intent is [38.0, 38.5) and [38.5, inf), which is what these rows now say. Under the rubric's literal '<= 38.4' a note reporting 101.2 F - the rubric's OWN Grade 1 endpoint - converts to 38.4444 and grades absent. Deviation from rules.md, recorded in rules_vs_booklet_discrepancies.md. The neighbouring gap at outcome 10 (Pain and Hurt score of exactly 60) carries no such evidence and stays open."
    ]
   },
   "37": {
