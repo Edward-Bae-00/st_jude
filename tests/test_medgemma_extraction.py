@@ -472,3 +472,36 @@ def test_an_unknown_file_type_is_recorded_raw_never_guessed():
     """A quantisation the map does not know must not be labelled as one it does.
     Recording the number keeps the provenance honest and debuggable."""
     assert GGUF_FILE_TYPES.get(999) is None
+
+
+# ------------------------------------------- prompt rules that unblock grading
+
+def test_the_survival_bullet_appears_only_where_a_table_grades_on_death():
+    """Every outcome with a `death_attributed` row is capped at grade_set while that
+    value is unknown, because the engine cannot rule out the top grade. The 2026-09-01
+    A100 run extracted it zero times in 80 pairs, and every graded pair it produced was
+    Fever - the one outcome of the four with no death row. Asking for it elsewhere would
+    be noise, so the bullet is conditional on the table needing it."""
+    for num in ("28", "48", "19"):                      # tables with a grade-5 death row
+        assert '"death_attributed": false' in build_prompt(NOTE, num), num
+    assert "death_attributed" not in build_prompt(NOTE, "36")   # Fever grades on temp only
+
+
+def test_the_prompt_tells_the_model_not_to_convert_units():
+    """The pipeline converts from the quote, which is the only trustworthy source. A model
+    that converts first produces a number matching neither its quote nor the conversion,
+    and the unit guard has to reject it - losing a real value."""
+    p = build_prompt(NOTE, "36")
+    assert "OWN units" in p and "Do not convert" in p
+
+
+def test_the_prompt_forbids_null_findings_rather_than_merely_discouraging_them():
+    p = build_prompt(NOTE, "48")
+    assert "NEVER emit a finding whose value or quote is null" in p
+    assert "An empty\n  list is a valid" in p
+
+
+def test_the_prompt_says_which_of_several_values_to_report():
+    """'At most ONCE' alone does not say WHICH one, and the schema already answers it."""
+    p = build_prompt(NOTE, "28")
+    assert "at most ONCE" in p and '"highest"' in p

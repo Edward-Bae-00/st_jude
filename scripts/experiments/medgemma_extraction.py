@@ -127,6 +127,22 @@ def build_prompt(note: str, outcome: str) -> str:
     if table.on: needed.add(table.on)
     needed = sorted(expand_derived(needed))
     lines = "\n".join(f"  - {feature_brief(n, outcome)}" for n in needed)
+
+    # Only for tables that actually grade on it. Every outcome with a `death_attributed`
+    # row is capped at grade_set while that value is unknown - the engine cannot rule out
+    # the top grade - so an omission that looks neutral silently prevents any definite
+    # grade. The 2026-09-01 A100 run extracted it zero times across 80 pairs, and every
+    # graded pair it produced was Fever, the one outcome of the four with no death row.
+    # This does not weaken the section 2 contract: "discharged home on day 5" is a
+    # verbatim quote, and it supports `false`.
+    survival = ""
+    if "death_attributed" in needed:
+        survival = (
+            '\n- Absence of an event can be explicitly supported. If the note shows the patient '
+            'survived\n  this episode - discharge, follow-up, recovery, ongoing care - report '
+            '"death_attributed": false\n  and quote that text. Leaving it unknown is not neutral: '
+            'no outcome can be graded\n  while it is unknown whether the patient died.')
+
     return f"""You are reading a clinical note and extracting specific findings. \
 You are NOT assigning a severity grade - that is done separately by a rule engine.
 
@@ -137,11 +153,15 @@ Extract only these findings:
 
 Rules:
 - Report a finding ONLY if the note explicitly supports it. Omit anything the note does not address.
-  Omitting is correct and expected; guessing is not.
-- Extract each finding at most ONCE. Do NOT repeat findings.
+  Omitting is correct and expected; guessing is not.{survival}
+- Report each feature at most ONCE. Where its definition names an extreme ("highest",
+  "maximum", "most intensive"), report that one value, not every occurrence.
+- For a number, copy it as the note states it, in the note's OWN units, and let the quote carry
+  both the number and its unit. Do not convert - the pipeline does that.
 - Every finding MUST include "quote": a concise sentence or phrase copied EXACTLY from the note,
   character for character. If you cannot copy an exact supporting quote, do not report the finding.
-  Do NOT include findings with null, empty, or unquoted text.
+- NEVER emit a finding whose value or quote is null. Leave it out of the list entirely. An empty
+  list is a valid and often correct answer.
 - "present" is whether the note evidences this health outcome at all.
 
 Reply with JSON only, no prose:
