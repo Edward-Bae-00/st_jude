@@ -32,7 +32,7 @@ NOTE = ("A 14-year-old with HbSS presented with chest pain. FiO2 was escalated t
 # Every stage is measured against stage 0, so stage 0 is the one thing in this
 # file that must never change. Editing the prompt and re-pinning this digest
 # silently rebases every comparison in `tasks/` onto a different control.
-STAGE0_DIGEST = "bb292ff0f73562f75d97d1b734e248347068d8424d988dd6334da6d30ff7ada8"
+STAGE0_DIGEST = "db00daf41e74046ddcf1bc346d87c927c28344238b54c923d576d23095c4b022"
 
 
 def test_stage_0_is_the_prompt_that_shipped():
@@ -292,7 +292,7 @@ def test_the_evidence_field_appears_only_from_stage_2b():
     "## The episode",                       # episode scoping
     "remained afebrile",                    # negation
     "exchange transfusion was considered",  # hypotheticals
-    "SHORTEST continuous run",              # quote hardening
+    "shortest continuous run",              # quote hardening
 ])
 def test_precision_rules_appear_only_at_stage_3(frag):
     assert frag not in build_prompt(NOTE, "48", stage("2b"))

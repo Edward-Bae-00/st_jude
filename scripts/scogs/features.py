@@ -56,7 +56,8 @@ F("resp_support", "ord",
   outcomes=["48","49","52"])
 
 F("fio2_pct", "num", "Highest documented FiO2 as a percentage. Room air is 21.",
-  unit="%", outcomes=["48"])
+  unit="%", outcomes=["48"],
+  per_outcome={"48":"FiO2 is what is DELIVERED to the patient (the oxygen concentration in inspired gas). SpO2 / pulse oximetry is what is MEASURED in the patient. Do not report SpO2 as FiO2."})
 
 F("vasopressors", "bool", "Vasoactive or vasopressor infusion given (norepinephrine, "
   "epinephrine, dopamine, dobutamine, milrinone).")

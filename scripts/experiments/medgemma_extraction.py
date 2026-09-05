@@ -156,7 +156,8 @@ ORD_CUES = {
     "transfusion_type":
         "none = no red cell transfusion; simple = top-up, packed red cells, straight "
         "transfusion; exchange = exchange transfusion, red cell exchange, "
-        "erythrocytapheresis, manual or automated exchange.",
+        "erythrocytapheresis, manual or automated exchange. "
+        "Plasma exchange (plasmapheresis) is NOT a red cell transfusion - do not report it here.",
     "care_setting":
         "home = managed without a facility visit; clinic_or_day_hospital = outpatient "
         "clinic, day unit, infusion centre; ed_treat_release = seen in the emergency "
@@ -372,8 +373,8 @@ def _rules_v1(needed: list[str], st: Stage) -> str:
 
     if st.precision:
         g.append(
-            "Quote the SHORTEST continuous run of the note's own words that proves the value, "
-            "usually\n3-12 words. Never join text from different sentences, never write '...', "
+            "Quote the shortest continuous run of the note's own words that proves the value. "
+            "Never join text from different sentences, never write '...', "
             "never fix a typo,\nnever paraphrase. Copy one continuous span or report nothing.")
 
     g.append(
